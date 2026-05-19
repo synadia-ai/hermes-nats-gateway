@@ -29,12 +29,13 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from typing import List
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.base import MessageEvent, MessageType
 from tests._nats_sdk_mock import _ensure_synadia_agents_mock  # noqa: F401
 from tests._helpers import load_adapter
 
