@@ -1,0 +1,87 @@
+[project]
+name = "hermes-nats-gateway"
+version = "0.1.0"
+description = "NATS Agent Protocol gateway for Hermes Agent. Out-of-tree platform plugin."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "Synadia" }]
+keywords = [
+    "hermes",
+    "hermes-plugin",
+    "nats",
+    "nats-agent-protocol",
+    "synadia",
+    "ai-agent",
+    "gateway",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+dependencies = [
+    "synadia-ai-agents>=0.7",
+    "synadia-ai-agent-service>=0.4",
+    "nats-py>=2.7",
+    "pyyaml>=6",
+]
+
+[project.urls]
+Homepage   = "https://github.com/synadia-ai/hermes-nats-gateway"
+Repository = "https://github.com/synadia-ai/hermes-nats-gateway"
+Issues     = "https://github.com/synadia-ai/hermes-nats-gateway/issues"
+Changelog  = "https://github.com/synadia-ai/hermes-nats-gateway/blob/main/CHANGELOG.md"
+
+[project.entry-points."hermes_agent.plugins"]
+nats-platform = "hermes_nats_gateway"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel.force-include]
+"__init__.py"  = "hermes_nats_gateway/__init__.py"
+"adapter.py"   = "hermes_nats_gateway/adapter.py"
+"_approval.py" = "hermes_nats_gateway/_approval.py"
+"plugin.yaml"  = "hermes_nats_gateway/plugin.yaml"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "__init__.py",
+    "adapter.py",
+    "_approval.py",
+    "plugin.yaml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+    "tests/",
+    "images/",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+namespace_packages = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff",
+    "mypy",
+]
