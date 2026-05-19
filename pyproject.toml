@@ -62,10 +62,12 @@ include = [
     "plugin.yaml",
     "README.md",
     "CHANGELOG.md",
+    "after-install.md",
     "LICENSE",
     "pyproject.toml",
     "tests/",
     "images/",
+    "scripts/",
 ]
 
 [tool.ruff]
