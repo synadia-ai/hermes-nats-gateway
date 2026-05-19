@@ -42,15 +42,29 @@ spec lives at
 # 1. Install Hermes, deferring the first-run wizard.
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup
 
-# 2. Install this plugin (clones the repo, installs into the Hermes venv).
+# 2. Install this plugin (clones the repo into ~/.hermes/plugins/).
 hermes plugins install synadia-ai/hermes-nats-gateway
 
-# 3. Configure NATS via the wizard (pick "NATS" from the platform list).
+# 3. Install the NATS runtime SDKs into the Hermes venv (NOT automatic — see below).
+bash ~/.hermes/plugins/nats-platform/scripts/install-sdks.sh
+
+# 4. Configure NATS via the wizard (pick "NATS" from the platform list).
 hermes setup
 
-# 4. Run the gateway.
+# 5. Run the gateway.
 hermes gateway run
 ```
+
+> **Step 3 is required — plugin install does not pull dependencies.** Hermes
+> plugins are distributed as git clones, so `hermes plugins install` does *not*
+> install this plugin's Python dependencies, and the Hermes venv is uv-managed
+> (no `pip`). The bundled `scripts/install-sdks.sh` finds the venv the `hermes`
+> command runs from — for both the `install.sh` and pip/editable layouts — and
+> installs the SDKs into it with `uv`; you don't need to know the venv path. Skip
+> this and the gateway logs `NATS: synadia-ai-agents / synadia-ai-agent-service
+> not installed` and silently won't register. The same instruction is shown
+> automatically by `after-install.md` right after step 2. To target a
+> non-standard install, pass the venv python: `… install-sdks.sh /path/to/venv/bin/python`.
 
 ### Install tracks `main` — there is no tag-pinned form
 
@@ -76,12 +90,12 @@ hermes plugins update nats-platform
   `ANTHROPIC_API_KEY`). The `/help` and `/status` commands work without one, but
   actual prompts need a model.
 
-The runtime NATS SDKs (`synadia-ai-agents`, `synadia-ai-agent-service`,
-`nats-py`) are declared as plugin dependencies and pulled in automatically by
-`hermes plugins install`. If you vendored the plugin some other way and the
-gateway logs `NATS: synadia-ai-agents / synadia-ai-agent-service not installed`
-at startup, install them into the Hermes venv directly — see
-[Troubleshooting](#troubleshooting).
+- **The NATS runtime SDKs** (`synadia-ai-agents`, `synadia-ai-agent-service`,
+  `nkeys`) installed into the **Hermes venv**. `hermes plugins install` does
+  *not* install them — run the one-time `scripts/install-sdks.sh` (see
+  [Quick install](#quick-install) step 3). Without them the gateway logs
+  `NATS: synadia-ai-agents / synadia-ai-agent-service not installed` and skips
+  registering the adapter.
 
 ## Configure
 
@@ -325,11 +339,10 @@ multiplexing within one process (use profiles).
 ## Troubleshooting
 
 **`NATS: synadia-ai-agents / synadia-ai-agent-service not installed` at startup**
-The runtime SDKs aren't on the gateway's Python. They install automatically with
-`hermes plugins install`; if you vendored the plugin manually, run
-`pip install synadia-ai-agents synadia-ai-agent-service nkeys` into the **Hermes
-venv** (not a global Python). The gateway skips registering the adapter when they
-are missing.
+The runtime SDKs aren't in the Hermes venv — `hermes plugins install` doesn't
+install them. Run `bash ~/.hermes/plugins/nats-platform/scripts/install-sdks.sh`
+(Quick install step 3). Installing into a global Python won't help — it must be
+the venv the `hermes` command runs from, which the script detects for you.
 
 **Gateway starts but `nats micro list` / discovery shows nothing**
 Check `enabled: true` and that exactly one of `NATS_URL` / `NATS_CONTEXT` (or
