@@ -1,6 +1,6 @@
 [project]
 name = "hermes-nats-gateway"
-version = "0.1.0"
+version = "0.1.0a1"
 description = "Synadia Agent Protocol for NATS gateway for Hermes Agent. Out-of-tree platform plugin."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -58,6 +58,7 @@ include = [
     "__init__.py",
     "adapter.py",
     "_approval.py",
+    "conftest.py",
     "plugin.yaml",
     "README.md",
     "CHANGELOG.md",
@@ -77,11 +78,22 @@ namespace_packages = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests"]
+# importlib mode prevents pytest from inferring `tests/` as a subpackage of the
+# plugin-root `__init__.py` (which the wheel build pins for hatch's
+# force-include). Without this, collection walks up, tries to import the root
+# `__init__.py`, and fails on its relative `from .adapter import register`.
+pythonpath = ["."]
+markers = [
+    "integration: requires a running nats-server on a non-conflicting port (e.g. 14222)",
+]
+addopts = "-m 'not integration' --import-mode=importlib"
 
 [dependency-groups]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    "hermes-agent>=0.14.0",
     "ruff",
     "mypy",
 ]

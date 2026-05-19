@@ -1,7 +1,7 @@
 name: nats-platform
 label: NATS
 kind: platform
-version: 1.0.0
+version: 0.1.0a1
 description: >
   Synadia Agent Protocol for NATS (v0.3) gateway adapter for Hermes Agent.
   Registers a synadia_ai.agents.AgentService at the subject
