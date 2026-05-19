@@ -1,7 +1,7 @@
 [project]
 name = "hermes-nats-gateway"
 version = "0.1.0"
-description = "NATS Agent Protocol gateway for Hermes Agent. Out-of-tree platform plugin."
+description = "Synadia Agent Protocol for NATS gateway for Hermes Agent. Out-of-tree platform plugin."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
@@ -10,7 +10,7 @@ keywords = [
     "hermes",
     "hermes-plugin",
     "nats",
-    "nats-agent-protocol",
+    "synadia-agent-protocol",
     "synadia",
     "ai-agent",
     "gateway",

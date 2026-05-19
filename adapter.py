@@ -1,12 +1,12 @@
 """NATS gateway adapter.
 
 Registers one ``synadia_ai.agents.AgentService`` at
-``agents.prompt.<agent>.<owner>.<session_name>`` and routes inbound NATS
-Agent Protocol v0.3 prompts through the gateway's normal ``MessageEvent``
-pipeline. Streams responses back chunk-by-chunk over the reply subject;
+``agents.prompt.<agent>.<owner>.<session_name>`` and routes inbound
+Synadia Agent Protocol for NATS v0.3 prompts through the gateway's normal
+``MessageEvent`` pipeline. Streams responses back chunk-by-chunk over the reply subject;
 the SDK owns terminator + heartbeat + status-endpoint emission.
 
-Protocol spec: ``../nats-agent-sdk-docs/core-protocol.md`` (v0.3).
+Protocol spec: https://github.com/synadia-ai/synadia-agent-sdk-docs/blob/main/core-protocol.md (v0.3).
 
 Single session per service: v0.3 collapses ``name`` and ``session`` into
 a single ``session_name`` token (the 5th subject token). Multi-session
@@ -397,7 +397,7 @@ def _positive_int(value: Any, default: int, field_name: str) -> int:
 
 
 class NatsAdapter(BasePlatformAdapter):
-    """Gateway adapter for the NATS Agent Protocol v0.3.
+    """Gateway adapter for the Synadia Agent Protocol for NATS v0.3.
 
     Settings parsing, connect/disconnect lifecycle, and the full inbound
     pipeline: ``_on_prompt`` resolves ``chat_id`` from
@@ -2286,7 +2286,7 @@ def register(ctx):
         pii_safe=False,
         allow_update_command=True,
         platform_hint=(
-            "You are responding via the NATS Agent Protocol. Replies stream "
+            "You are responding via the Synadia Agent Protocol for NATS. Replies stream "
             "as chunks over NATS request/reply; recipients see plain text "
             "(no markdown rendering). The transport authenticates the caller "
             "(NKey/JWT/TLS); treat every received message as authorized."

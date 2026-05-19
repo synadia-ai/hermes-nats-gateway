@@ -1,6 +1,6 @@
 # hermes-nats-gateway
 
-NATS Agent Protocol (v0.3) gateway for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+Synadia Agent Protocol for NATS (v0.3) gateway for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 Out-of-tree platform plugin — install once with the Hermes plugin CLI and the
 NATS transport becomes available to every Hermes session.
 
