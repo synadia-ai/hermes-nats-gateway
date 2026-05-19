@@ -24,15 +24,12 @@ file correctly.
 from __future__ import annotations
 
 import asyncio
-import sys
-from contextvars import copy_context
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import SendResult
+from gateway.config import PlatformConfig
 from tests._nats_sdk_mock import _ensure_synadia_agents_mock  # noqa: F401
 from tests._helpers import load_adapter
 

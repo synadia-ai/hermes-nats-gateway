@@ -116,7 +116,6 @@ platforms:
         self, profile_env, monkeypatch
     ):
         # Active profile == 'work', and 'work' has the same triple. Must not flag.
-        play = profile_env / ".hermes" / "profiles" / "play"
         work = profile_env / ".hermes" / "profiles" / "work"
         work.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(work))

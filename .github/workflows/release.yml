@@ -1,0 +1,40 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write    # for creating the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Verify tag matches pyproject + plugin.yaml versions
+        run: |
+          set -ex
+          TAG="${GITHUB_REF_NAME#v}"
+          uv sync
+          PY=$(uv run python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          PL=$(uv run python -c 'import yaml; print(yaml.safe_load(open("plugin.yaml"))["version"])')
+          if [ "$TAG" != "$PY" ] || [ "$TAG" != "$PL" ]; then
+            echo "version mismatch: tag=$TAG pyproject=$PY plugin=$PL"
+            exit 1
+          fi
+      - name: Run tests on release-matrix
+        run: |
+          uv run ruff check .
+          uv run pytest -v
+      - name: Build artifacts
+        run: uv build
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          generate_release_notes: true
+# NOTE: No PyPI publish step. The synadia-ai org has live PyPI trusted-publishing
+# infrastructure; adding any publish step here (even commented out) is unsafe at v0.1.0.
+# PyPI publish is a deliberate v0.2+ decision — tracked in CHANGELOG / issues.

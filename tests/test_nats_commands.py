@@ -37,12 +37,11 @@ from tests._helpers import load_adapter
 
 _nats_mod = load_adapter()
 NatsAdapter = _nats_mod.NatsAdapter
-from hermes_cli.commands import (
+from hermes_cli.commands import (  # noqa: E402
     COMMAND_REGISTRY,
     GATEWAY_KNOWN_COMMANDS,
     _is_gateway_available,
     _resolve_config_gates,
-    gateway_help_lines,
     resolve_command,
 )
 
