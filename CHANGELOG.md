@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-20
+
+### Fixed
+- SDK-install gap: `hermes plugins install` git-clones the plugin but does not
+  install its Python dependencies. Ship `scripts/install-sdks.sh` and
+  `after-install.md`, and correct the README's "pulled in automatically" claim
+  so the NATS SDK is actually installed.
+- Stabilized the intermittently-flaky
+  `tests/test_nats_inbound.py::TestRunTextPromptFallback::test_final_text_skipped_when_deltas_already_streamed`
+  (~1/3 of CI matrix jobs). Test-side fix only: the executor is now run inline
+  and the assertion checks the streamed texts. Root cause was a CI-runner
+  loop-teardown race in the test harness reaching the `_delta_callback`
+  shutdown drop branch — not a defect in the transport or hot path.
+
 ## [0.1.0] - 2026-05-20
 
 ### Added
