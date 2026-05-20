@@ -202,11 +202,13 @@ hermes profile create bob
 hermes -p alice plugins install synadia-ai/hermes-nats-gateway
 hermes -p bob   plugins install synadia-ai/hermes-nats-gateway
 
-# 3. Configure each: provide LLM API keys AND configure NATS — pick a transport
-#    (demo / URL / context) and set session_name to the profile name. Do NOT
-#    skip the transport, or the gateway fails config validation at startup.
-hermes -p alice setup gateway
-hermes -p bob   setup gateway
+# 3. Configure each profile with the FULL wizard: `setup` walks LLM API keys
+#    *and* platforms, so when it reaches NATS, pick a transport (demo / URL /
+#    context) and set session_name to the profile name. Don't skip the
+#    transport, or the gateway fails config validation at startup.
+#    (`setup gateway` only re-configures NATS — it does NOT set LLM API keys.)
+hermes -p alice setup
+hermes -p bob   setup
 
 # 4. Run both — each profile is its own AgentService / session.
 hermes -p alice gateway run &

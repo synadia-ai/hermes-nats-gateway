@@ -577,3 +577,70 @@ def test_check_nats_requirements_reports_sdk_availability():
     # runs, so the requirements check must report True both in CI (no real
     # SDK) and locally (real SDK installed).
     assert check_nats_requirements() is True
+
+
+# ---------------------------------------------------------------------------
+# Transport-gap diagnostic
+# ---------------------------------------------------------------------------
+
+
+class TestNatsTransportDiagnostic:
+    """``validate_config`` emits a precise, once-per-process warning when a
+    profile has identity but no (or an ambiguous) transport — the half-config
+    a ``required_env``-only setup leaves behind. The registry only logs a
+    generic "config validation failed", so this guards the actionable message.
+    """
+
+    def _reset(self):
+        _nats_mod._transport_diagnostic_emitted = False
+
+    def test_identity_without_transport_warns_about_transport(self, caplog):
+        self._reset()
+        cfg = PlatformConfig(
+            enabled=True, extra={"owner": "rene", "session_name": "one"}
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level("WARNING"):
+                assert _nats_mod.validate_config(cfg) is False
+        msg = caplog.text.lower()
+        assert "transport" in msg
+        assert "nats_url" in msg and "nats_context" in msg
+        # Explicitly distinguishes a config gap from a missing dependency —
+        # the misread that sent users chasing the SDK install.
+        assert "not a missing dependency" in msg
+
+    def test_both_transports_warns_about_xor(self, caplog):
+        self._reset()
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={
+                "servers": ["nats://x:4222"],
+                "context": "c",
+                "owner": "rene",
+                "session_name": "one",
+            },
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level("WARNING"):
+                assert _nats_mod.validate_config(cfg) is False
+        assert "exactly one" in caplog.text.lower()
+
+    def test_diagnostic_emitted_once_per_process(self, caplog):
+        self._reset()
+        cfg = PlatformConfig(
+            enabled=True, extra={"owner": "rene", "session_name": "one"}
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level("WARNING"):
+                _nats_mod.validate_config(cfg)
+                _nats_mod.validate_config(cfg)
+        # The flag suppresses the second emission within a process.
+        assert caplog.text.lower().count("no transport") == 1
+
+    def test_unconfigured_profile_stays_silent(self, caplog):
+        self._reset()
+        cfg = PlatformConfig(enabled=True, extra={})
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level("WARNING"):
+                assert _nats_mod.validate_config(cfg) is False
+        assert caplog.text.strip() == ""

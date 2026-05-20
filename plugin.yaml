@@ -13,6 +13,14 @@ author: Synadia Communications, Inc.
 # ``requires_env`` and ``optional_env`` entries are surfaced in the
 # ``hermes config`` UI via the platform-plugin env var injector in
 # ``hermes_cli/config.py``.
+#
+# A transport is also REQUIRED — exactly one of NATS_URL / NATS_CONTEXT — but
+# ``requires_env`` is a flat "all of these must be set" list and cannot express
+# that XOR, so the two transport vars stay under ``optional_env`` and the rule
+# is enforced at runtime by ``adapter.validate_config``. Configure via
+# ``hermes setup gateway`` (its wizard always asks for a transport); the bare
+# ``hermes config`` env editor lets you skip it and leave a half-config that
+# fails validation at gateway start.
 requires_env:
   - name: HERMES_NATS_OWNER
     description: "Owner token — the 4th segment of the NATS subject (e.g. your GitHub handle)"
@@ -24,11 +32,11 @@ requires_env:
     password: false
 optional_env:
   - name: NATS_URL
-    description: "NATS server URL (e.g. nats://demo.nats.io). Mutually exclusive with NATS_CONTEXT — exactly one is required at the application layer (enforced by validate_config)."
+    description: "TRANSPORT (REQUIRED — set exactly one of NATS_URL or NATS_CONTEXT): NATS server URL, e.g. nats://demo.nats.io. Mutually exclusive with NATS_CONTEXT; enforced by validate_config at gateway start."
     prompt: "NATS server URL"
     password: false
   - name: NATS_CONTEXT
-    description: "Name of an existing NATS CLI context to use for connection options. Mutually exclusive with NATS_URL — exactly one is required at the application layer (enforced by validate_config)."
+    description: "TRANSPORT (REQUIRED — set exactly one of NATS_URL or NATS_CONTEXT): name of an existing NATS CLI context for connection options. Mutually exclusive with NATS_URL; enforced by validate_config at gateway start."
     prompt: "NATS context name"
     password: false
   - name: HERMES_NATS_AGENT

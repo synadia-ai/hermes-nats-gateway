@@ -6,6 +6,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Transport-gap diagnosis. A profile configured only through `required_env`
+  (owner + session, no `NATS_URL` / `NATS_CONTEXT`) failed to start with the
+  generic "config validation failed" / "adapter creation failed (check
+  dependencies and config)", which read as a missing-SDK problem. Now
+  `validate_config` logs a precise, once-per-process warning naming the missing
+  transport and stating it is *not* a dependency issue, and the `setup gateway`
+  wizard no longer reports such a half-config as "already configured" (it only
+  counts a complete config — transport + owner + session — so it walks the user
+  through picking a transport instead of defaulting the reconfigure prompt to
+  No). `plugin.yaml` now flags `NATS_URL` / `NATS_CONTEXT` as a required
+  transport (the XOR can't be expressed in `required_env`, so it stays enforced
+  at runtime).
+- README profiles section: document that each profile needs its own
+  `hermes -p <name> plugins install …` (plugins live per-`HERMES_HOME`), that
+  the SDK install is once-per-machine (shared venv) not per-profile, and that
+  full configuration uses `hermes -p <name> setup` (LLM keys + NATS), not
+  `setup gateway` (NATS-only).
+
 ## [0.1.1] - 2026-05-20
 
 ### Fixed

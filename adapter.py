@@ -1937,6 +1937,13 @@ def check_requirements() -> bool:
     )
 
 
+# Set once we've logged the transport-gap diagnostic, so a misconfigured
+# profile explains itself exactly once per process instead of on every
+# ``validate_config`` call (the registry calls it at adapter creation, and
+# ``is_connected`` calls it again whenever status is rendered).
+_transport_diagnostic_emitted = False
+
+
 def validate_config(config) -> bool:
     """Return ``True`` iff the platform config has enough info to connect.
 
@@ -1948,17 +1955,44 @@ def validate_config(config) -> bool:
     Reads env vars as a fallback so env-only setups (no ``config.yaml``)
     validate the same way the gateway's ``_apply_env_overrides`` materializes
     them.
+
+    When validation fails because a transport is missing or ambiguous — the
+    common case for a profile configured only via ``required_env`` (owner +
+    session, no ``NATS_URL`` / ``NATS_CONTEXT``) — emit a precise, actionable
+    warning. The registry only logs a generic "config validation failed",
+    which is easily misread as a missing-SDK problem; this says exactly what's
+    wrong and that it is *not* a dependency issue.
     """
     extra = getattr(config, "extra", {}) or {}
     has_url = bool(os.getenv("NATS_URL", "").strip()) or bool(extra.get("servers"))
     has_ctx = bool(os.getenv("NATS_CONTEXT", "").strip()) or bool(extra.get("context"))
-    if has_url == has_ctx:  # both set or neither set → invalid (XOR)
-        return False
     owner = os.getenv("HERMES_NATS_OWNER", "").strip() or extra.get("owner", "")
     session = (
         os.getenv("HERMES_NATS_SESSION_NAME", "").strip()
         or extra.get("session_name", "")
     )
+    if has_url == has_ctx:  # both set or neither set → invalid (XOR)
+        # Only diagnose when the user has clearly *started* configuring NATS
+        # (identity present); a wholly-unconfigured profile isn't using NATS
+        # and should stay silent.
+        global _transport_diagnostic_emitted
+        if (owner or session) and not _transport_diagnostic_emitted:
+            _transport_diagnostic_emitted = True
+            if has_url and has_ctx:
+                logger.warning(
+                    "NATS: both NATS_URL and NATS_CONTEXT are set, but exactly "
+                    "one transport is allowed. Unset one — e.g. run "
+                    "'hermes setup gateway' (or 'hermes -p <profile> setup gateway')."
+                )
+            else:
+                logger.warning(
+                    "NATS: identity is set (owner/session) but no transport is "
+                    "configured, so the adapter cannot start. Set NATS_URL or "
+                    "NATS_CONTEXT — e.g. run 'hermes setup gateway' (or "
+                    "'hermes -p <profile> setup gateway'). The SDKs are present; "
+                    "this is a configuration gap, not a missing dependency."
+                )
+        return False
     return bool(owner and session)
 
 
@@ -2166,11 +2200,20 @@ def interactive_setup() -> None:
 
     print_header("NATS")
 
+    # "Already configured" must mean a *complete* config — a transport
+    # (NATS_URL XOR NATS_CONTEXT) plus owner and session. Keying off owner or
+    # session alone (as before) made a profile set up via `required_env` only
+    # — owner + session, no transport — report "already configured" and default
+    # the reconfigure prompt to No, so the user skipped the very step (picking a
+    # transport) that the config was missing, then hit "config validation
+    # failed" at gateway start. Mirror validate_config's XOR so a half-config
+    # falls straight through into configuration instead of being skipped.
+    has_url = bool(get_env_value("NATS_URL"))
+    has_ctx = bool(get_env_value("NATS_CONTEXT"))
     already = (
-        bool(get_env_value("NATS_URL"))
-        or bool(get_env_value("NATS_CONTEXT"))
-        or bool(get_env_value("HERMES_NATS_OWNER"))
-        or bool(get_env_value("HERMES_NATS_SESSION_NAME"))
+        (has_url != has_ctx)
+        and bool(get_env_value("HERMES_NATS_OWNER"))
+        and bool(get_env_value("HERMES_NATS_SESSION_NAME"))
     )
     if already:
         print_info("NATS: already configured")
