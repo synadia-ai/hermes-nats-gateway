@@ -6,6 +6,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- NATS now auto-enables only when it is **completely configured** (a transport
+  — `NATS_URL` XOR `NATS_CONTEXT` — plus `HERMES_NATS_OWNER` and
+  `HERMES_NATS_SESSION_NAME`). This supersedes the 2026-04-21 "enable on any
+  NATS var, validate narrowly" behavior: `check_requirements` (the plugin's
+  `check_fn`) used to return True for any partial config, so the gateway setup
+  UI — which falls back to `check_fn` for its "configured?" status — mislabeled
+  a half-config (owner + session, no transport) as "configured", pre-selected
+  and skipped it so the transport never got set, and the gateway logged an
+  `ERROR` for the doomed adapter on every start. A half-config now reads as
+  "not configured" everywhere and is diagnosed once instead of enabled-broken.
+
+### Fixed
+- Transport-gap diagnosis. A profile configured only through `required_env`
+  (owner + session, no `NATS_URL` / `NATS_CONTEXT`) failed to start with the
+  generic "config validation failed" / "adapter creation failed (check
+  dependencies and config)", which read as a missing-SDK problem. Now
+  `check_requirements` and `validate_config` share a one-time diagnostic that
+  names the precise gap (missing transport, ambiguous transport, or incomplete
+  identity) and states it is *not* a dependency issue, and the `setup gateway`
+  wizard no longer reports such a half-config as "already configured" (it only
+  counts a complete config — transport + owner + session — so it walks the user
+  through picking a transport instead of defaulting the reconfigure prompt to
+  No). `plugin.yaml` now flags `NATS_URL` / `NATS_CONTEXT` as a required
+  transport (the XOR can't be expressed in `required_env`, so it stays enforced
+  at runtime).
+- README profiles section: document that each profile needs its own
+  `hermes -p <name> plugins install …` (plugins live per-`HERMES_HOME`), that
+  the SDK install is once-per-machine (shared venv) not per-profile, and that
+  full configuration uses `hermes -p <name> setup` (LLM keys + NATS), not
+  `setup gateway` (NATS-only).
+
 ## [0.1.1] - 2026-05-20
 
 ### Fixed

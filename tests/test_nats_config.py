@@ -462,9 +462,16 @@ class TestNatsEnvOverrides:
         base.update(overrides)
         return {k: v for k, v in base.items() if v}
 
-    def test_nats_url_enables_and_populates_servers(self):
+    def test_full_url_config_enables_and_populates_servers(self):
+        # check_fn (and thus env-driven enablement) requires a *complete*,
+        # connectable config: transport + owner + session.
         config = GatewayConfig()
-        with patch.dict(os.environ, self._nats_env(NATS_URL="nats://127.0.0.1:4222"), clear=True):
+        env = self._nats_env(
+            NATS_URL="nats://127.0.0.1:4222",
+            HERMES_NATS_OWNER="rene",
+            HERMES_NATS_SESSION_NAME="default",
+        )
+        with patch.dict(os.environ, env, clear=True):
             _apply_env_overrides(config)
 
         assert Platform("nats") in config.platforms
@@ -472,9 +479,14 @@ class TestNatsEnvOverrides:
         assert platform_cfg.enabled is True
         assert platform_cfg.extra["servers"] == ["nats://127.0.0.1:4222"]
 
-    def test_nats_context_enables_and_populates_context(self):
+    def test_full_context_config_enables_and_populates_context(self):
         config = GatewayConfig()
-        with patch.dict(os.environ, self._nats_env(NATS_CONTEXT="local-nats"), clear=True):
+        env = self._nats_env(
+            NATS_CONTEXT="local-nats",
+            HERMES_NATS_OWNER="rene",
+            HERMES_NATS_SESSION_NAME="default",
+        )
+        with patch.dict(os.environ, env, clear=True):
             _apply_env_overrides(config)
 
         platform_cfg = config.platforms[Platform("nats")]
@@ -498,15 +510,27 @@ class TestNatsEnvOverrides:
         assert extra["owner"] == "rene"
         assert extra["session_name"] == "default"
 
-    def test_identity_only_enables_but_stays_disconnected(self):
-        # Decision log 2026-04-21: HERMES_NATS_OWNER alone marks the
-        # platform enabled but lacks transport, so get_connected_platforms
-        # must still filter it out.
+    def test_transport_only_does_not_enable(self):
+        # Supersedes the 2026-04-21 "enable on any NATS var" decision: a
+        # transport without identity can't connect, so it must not enable.
+        config = GatewayConfig()
+        with patch.dict(
+            os.environ, self._nats_env(NATS_URL="nats://127.0.0.1:4222"), clear=True
+        ):
+            _apply_env_overrides(config)
+        assert Platform("nats") not in config.platforms
+
+    def test_identity_only_does_not_enable(self):
+        # Supersedes the 2026-04-21 decision (identity-only used to enable
+        # but stay disconnected). check_fn now requires a transport too, so a
+        # transport-less profile is "not configured" everywhere — never the
+        # enabled-but-broken state that mislabeled it as configured in the
+        # setup UI and logged an ERROR every gateway start.
         config = GatewayConfig()
         with patch.dict(os.environ, self._nats_env(HERMES_NATS_OWNER="rene"), clear=True):
             _apply_env_overrides(config)
 
-        assert config.platforms[Platform("nats")].enabled is True
+        assert Platform("nats") not in config.platforms
         assert Platform("nats") not in config.get_connected_platforms()
 
     def test_no_env_vars_leaves_platform_absent(self):
@@ -577,3 +601,80 @@ def test_check_nats_requirements_reports_sdk_availability():
     # runs, so the requirements check must report True both in CI (no real
     # SDK) and locally (real SDK installed).
     assert check_nats_requirements() is True
+
+
+# ---------------------------------------------------------------------------
+# Transport-gap diagnostic
+# ---------------------------------------------------------------------------
+
+
+class TestNatsTransportDiagnostic:
+    """``validate_config`` emits a precise, once-per-process warning when a
+    profile has identity but no (or an ambiguous) transport — the half-config
+    a ``required_env``-only setup leaves behind. The registry only logs a
+    generic "config validation failed", so this guards the actionable message.
+    """
+
+    def _reset(self):
+        _nats_mod._config_diagnostic_emitted = False
+
+    def test_identity_without_transport_warns_about_transport(self, caplog):
+        self._reset()
+        cfg = PlatformConfig(
+            enabled=True, extra={"owner": "rene", "session_name": "one"}
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level("WARNING"):
+                assert _nats_mod.validate_config(cfg) is False
+        msg = caplog.text.lower()
+        assert "transport" in msg
+        assert "nats_url" in msg and "nats_context" in msg
+        # Explicitly distinguishes a config gap from a missing dependency —
+        # the misread that sent users chasing the SDK install.
+        assert "not a missing dependency" in msg
+
+    def test_both_transports_warns_about_xor(self, caplog):
+        self._reset()
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={
+                "servers": ["nats://x:4222"],
+                "context": "c",
+                "owner": "rene",
+                "session_name": "one",
+            },
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level("WARNING"):
+                assert _nats_mod.validate_config(cfg) is False
+        assert "exactly one" in caplog.text.lower()
+
+    def test_transport_without_identity_warns_about_identity(self, caplog):
+        self._reset()
+        cfg = PlatformConfig(enabled=True, extra={"servers": ["nats://x:4222"]})
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level("WARNING"):
+                assert _nats_mod.validate_config(cfg) is False
+        msg = caplog.text.lower()
+        assert "identity is incomplete" in msg
+        assert "hermes_nats_owner" in msg and "hermes_nats_session_name" in msg
+
+    def test_diagnostic_emitted_once_per_process(self, caplog):
+        self._reset()
+        cfg = PlatformConfig(
+            enabled=True, extra={"owner": "rene", "session_name": "one"}
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level("WARNING"):
+                _nats_mod.validate_config(cfg)
+                _nats_mod.validate_config(cfg)
+        # The flag suppresses the second emission within a process.
+        assert caplog.text.lower().count("no transport") == 1
+
+    def test_unconfigured_profile_stays_silent(self, caplog):
+        self._reset()
+        cfg = PlatformConfig(enabled=True, extra={})
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level("WARNING"):
+                assert _nats_mod.validate_config(cfg) is False
+        assert caplog.text.strip() == ""
