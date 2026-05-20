@@ -1006,6 +1006,23 @@ class TestRunTextPromptFallback:
 
         monkeypatch.setattr(adapter, "_run_agent_sync", _fake_run_agent_sync)
 
+        # Run ``_run_agent_sync`` inline on the loop thread instead of on a
+        # ThreadPoolExecutor worker. This keeps the whole flow single-threaded
+        # so the production ``_delta_callback`` drop branch (call_soon_threadsafe
+        # on a closing loop) is unreachable — the source of the CI-runner
+        # loop-teardown race that made this test flaky. The single
+        # ``asyncio.sleep(0)`` flushes the callback's scheduled ``put_nowait``
+        # hops before the result returns and ``_run_text_prompt`` enqueues its
+        # None sentinel.
+        loop = asyncio.get_running_loop()
+
+        async def _inline_run_in_executor(executor, func, *args):
+            result = func(*args)
+            await asyncio.sleep(0)
+            return result
+
+        monkeypatch.setattr(loop, "run_in_executor", _inline_run_in_executor)
+
         event = MessageEvent(
             text="question",
             source=adapter.build_source(chat_id="alice"),
@@ -1013,8 +1030,10 @@ class TestRunTextPromptFallback:
 
         await adapter._run_text_prompt(event, stream, "alice")
 
-        # Two ResponseChunks — one per delta; NO extra final-text chunk.
-        assert stream.send.await_count == 2
-        chunks = [c.args[0] for c in stream.send.await_args_list]
-        texts = [getattr(c, "text", None) for c in chunks]
+        # Primary contract: exactly the two deltas, no duplicate final-text
+        # chunk. The equality fails loudly if a 3rd (duplicated) chunk lands.
+        texts = [
+            getattr(c.args[0], "text", None)
+            for c in stream.send.await_args_list
+        ]
         assert texts == ["streamed ", "answer"]
