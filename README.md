@@ -187,26 +187,42 @@ If you manage NATS credentials via `nats context`, set `NATS_CONTEXT` (env) or
 Protocol v0.3 collapsed `name` and `session` into a single `session_name` token:
 **one `AgentService` serves exactly one session.** To run several sessions on one
 machine, use Hermes profiles — one profile per session. Each profile gets its own
-`HERMES_HOME`, its own `.env`, and its own `AgentService`:
+`HERMES_HOME`, its own `.env`, its own `AgentService`, and **its own copy of this
+plugin** (plugins live under each profile's `HERMES_HOME`, so a fresh profile
+starts without it):
 
 ```bash
-# Create one profile per session (positional name — NOT `-p`).
+# 1. Create one profile per session (positional name — NOT `-p`).
 hermes profile create alice
 hermes profile create bob
 
-# Configure each (pick NATS; set session_name to the profile name).
+# 2. Install this plugin INTO each profile and enable it (answer `y` when the
+#    wizard asks "Enable 'nats-platform' now?"). A profile does NOT inherit the
+#    default profile's plugins — skip this and `setup gateway` won't offer NATS.
+hermes -p alice plugins install synadia-ai/hermes-nats-gateway
+hermes -p bob   plugins install synadia-ai/hermes-nats-gateway
+
+# 3. Configure each: provide LLM API keys AND configure NATS — pick a transport
+#    (demo / URL / context) and set session_name to the profile name. Do NOT
+#    skip the transport, or the gateway fails config validation at startup.
 hermes -p alice setup gateway
 hermes -p bob   setup gateway
 
-# Run both — each profile is its own AgentService / session.
+# 4. Run both — each profile is its own AgentService / session.
 hermes -p alice gateway run &
 hermes -p bob   gateway run &
 ```
 
+> **You do _not_ re-run the SDK install (Quick install step 3) per profile.** The
+> NATS runtime SDKs live in the one shared Hermes venv that every profile's
+> `hermes` command runs from — install them once per machine. Only the plugin
+> *clone* and its *config* are per-profile; the Python deps are global.
+
 > `hermes profile create <name>` also installs a wrapper command `<name>` in
 > `~/.local/bin` (manage with `hermes profile alias`). If `~/.local/bin` is on
-> your `$PATH` you can drop the `-p` flag entirely — `alice setup gateway`,
-> `alice gateway run` are equivalent to the `hermes -p alice …` forms above.
+> your `$PATH` you can drop the `-p` flag entirely — `alice plugins install …`,
+> `alice setup gateway`, `alice gateway run` are equivalent to the
+> `hermes -p alice …` forms above.
 
 Two instances claiming the same `(agent, owner, session_name)` triple will
 **load-balance** prompts across each other (NATS queue-group semantics). The
