@@ -6,7 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-20
+
 ### Changed
+- Replaced the broken machine-local identity lock with a NATS-native
+  warn-but-start liveness probe. The old scoped lock misjudged a *live* profile
+  gateway as stale on `/proc`-less platforms (macOS/Windows) — a profile cmdline
+  (`hermes -p alice gateway run`) defeats upstream Hermes's process-liveness
+  oracle — and **stole** the lock. `connect()` now requests the SDK's status
+  subject before `service.start()`; if a responder answers it logs an
+  `ALREADY LIVE` warning and **starts anyway** (duplicate identities are
+  permitted for NATS queue-group HA). The setup wizard's collision check is
+  softened from hard-abort to a warning.
 - NATS now auto-enables only when it is **completely configured** (a transport
   — `NATS_URL` XOR `NATS_CONTEXT` — plus `HERMES_NATS_OWNER` and
   `HERMES_NATS_SESSION_NAME`). This supersedes the 2026-04-21 "enable on any

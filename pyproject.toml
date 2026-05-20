@@ -1,6 +1,6 @@
 [project]
 name = "hermes-nats-gateway"
-version = "0.1.1"
+version = "0.1.2"
 description = "Synadia Agent Protocol for NATS gateway for Hermes Agent. Out-of-tree platform plugin."
 readme = "README.md"
 license = { text = "Apache-2.0" }
