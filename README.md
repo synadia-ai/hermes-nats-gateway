@@ -198,15 +198,15 @@ hermes profile create bob
 
 # 2. Install this plugin INTO each profile and enable it (answer `y` when the
 #    wizard asks "Enable 'nats-platform' now?"). A profile does NOT inherit the
-#    default profile's plugins — skip this and `setup gateway` won't offer NATS.
+#    default profile's plugins — skip this and the setup wizard won't offer NATS.
 hermes -p alice plugins install synadia-ai/hermes-nats-gateway
 hermes -p bob   plugins install synadia-ai/hermes-nats-gateway
 
-# 3. Configure each profile with the FULL wizard: `setup` walks LLM API keys
-#    *and* platforms, so when it reaches NATS, pick a transport (demo / URL /
-#    context) and set session_name to the profile name. Don't skip the
-#    transport, or the gateway fails config validation at startup.
-#    (`setup gateway` only re-configures NATS — it does NOT set LLM API keys.)
+# 3. Configure each profile. `setup` runs the FULL wizard (LLM API keys AND
+#    platforms) — recommended. When it reaches NATS it shows "not configured";
+#    pick a transport (demo / URL / context) and set session_name to the
+#    profile name. Don't skip the transport, or the gateway fails config
+#    validation at startup.
 hermes -p alice setup
 hermes -p bob   setup
 
@@ -214,6 +214,11 @@ hermes -p bob   setup
 hermes -p alice gateway run &
 hermes -p bob   gateway run &
 ```
+
+> **Configuring only NATS (no LLM keys):** use the gateway setup section instead
+> of the full wizard — `hermes -p alice gateway setup` (equivalently
+> `hermes -p alice setup gateway`). Use this to (re)configure NATS on a profile
+> whose LLM provider is already set up.
 
 > **You do _not_ re-run the SDK install (Quick install step 3) per profile.** The
 > NATS runtime SDKs live in the one shared Hermes venv that every profile's
