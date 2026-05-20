@@ -1,4 +1,11 @@
-"""Tests for NATS profile-lock collision detection in the setup wizard."""
+"""Tests for NATS cross-profile identity-collision detection in the setup wizard.
+
+The wizard scans sibling profiles for a shared ``(agent, owner, session_name)``
+triple and *warns* (it no longer hard-fails — duplicate identities are allowed
+for HA and merely load-balance prompts). These tests pin the detection helper
+``_find_nats_profile_collisions``; the warn-vs-block reaction is exercised
+elsewhere.
+"""
 from pathlib import Path
 from types import SimpleNamespace
 

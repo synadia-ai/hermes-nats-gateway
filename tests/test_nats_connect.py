@@ -2,30 +2,31 @@
 
 Covers:
 
-* Happy-path ``connect()`` — lock acquisition, ``nats.connect`` kwargs,
+* Happy-path ``connect()`` — ``nats.connect`` kwargs,
   :class:`AgentService` construction, prompt-handler registration,
   ``service.start()`` call order, ``_mark_connected``.
-* Lock conflict — second local profile on the same agent/owner/session_name
-  fails fast with ``retryable=False`` so ``gateway/run.py`` doesn't schedule
-  a 30-s reconnect loop for something only a human can resolve.
+* Identity liveness probe — a best-effort, **warn-but-start** NATS lookup
+  runs before ``service.start()``: a live responder logs a warning and the
+  gateway starts anyway; a free identity (``NoRespondersError``) is silent;
+  any probe failure is swallowed so startup never blocks.
 * Exception propagation — errors from ``nats.connect`` /
   ``AgentService(...)`` / ``service.start()`` each yield a
-  ``retryable=True`` fatal error, release the lock, and leave no
-  dangling service/nc handles.
+  ``retryable=True`` fatal error and leave no dangling service/nc handles.
 * Fatal-after-init — a misconfigured adapter (no servers/context) stays
   fatal and never touches the SDK when ``connect()`` is called.
-* Idempotent ``disconnect()`` — teardown order is service.stop → nc.close →
-  release lock, and repeat calls are no-ops.
+* Idempotent ``disconnect()`` — teardown order is service.stop → nc.close,
+  and repeat calls are no-ops.
 
 The ``_ensure_synadia_agents_mock`` autouse in ``conftest.py`` installs a mock
-``synadia_ai.agents`` module; ``gateway.status.acquire_scoped_lock`` /
-``release_scoped_lock`` are monkeypatched per-test so nothing touches the
-real filesystem lock directory.
+``synadia_ai.agents`` module (or short-circuits to the real SDK when it's
+installed); the ``mock_nats`` fixture below stubs ``nats.connect`` and the
+liveness-probe ``nc.request`` per test.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -116,37 +117,23 @@ def mock_nats(monkeypatch):
     URL/context resolution and against the returned client mock for
     ``.close()`` lifecycle.
 
-    Sets ``return_value.max_payload`` to 1 MiB so the new
-    broker-derivation path in ``_on_connect`` (PR #41 alignment) has an
-    integer to format. Tests that exercise larger brokers can override.
+    Sets ``return_value.max_payload`` to 1 MiB so the broker-derivation
+    path in ``_on_connect`` has an integer to format.
+
+    Also stubs the returned client's ``request`` (used by the identity
+    liveness probe) to raise ``NoRespondersError`` by default — i.e. the
+    common "identity is free" path, which keeps the happy-path tests
+    warning-free. Collision / probe-failure tests override ``request``.
     """
     mod = sys.modules["nats"]
     mod.connect = AsyncMock()
     mod.connect.return_value.close = AsyncMock()
     mod.connect.return_value.max_payload = 1024 * 1024  # 1 MiB
+    # Default probe result: nobody home → identity free → no warning.
+    mod.connect.return_value.request = AsyncMock(
+        side_effect=mod.errors.NoRespondersError()
+    )
     return mod
-
-
-@pytest.fixture
-def lock_granted(monkeypatch):
-    """Install a lock stub that always grants the lock.
-
-    Records calls so tests can verify scope + identity without hitting
-    the real filesystem-backed lock directory.
-    """
-    calls: list[tuple] = []
-    releases: list[tuple] = []
-
-    def _acquire(scope, identity, metadata=None):
-        calls.append((scope, identity, metadata or {}))
-        return True, None
-
-    def _release(scope, identity):
-        releases.append((scope, identity))
-
-    monkeypatch.setattr("gateway.status.acquire_scoped_lock", _acquire)
-    monkeypatch.setattr("gateway.status.release_scoped_lock", _release)
-    return {"acquires": calls, "releases": releases}
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +144,7 @@ def lock_granted(monkeypatch):
 class TestConnectHappyPath:
     @pytest.mark.asyncio
     async def test_connect_returns_true_and_marks_connected(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         adapter = _build_adapter()
         assert await adapter.connect() is True
@@ -170,7 +157,7 @@ class TestConnectHappyPath:
 
     @pytest.mark.asyncio
     async def test_connect_passes_servers_to_nats_connect(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         adapter = _build_adapter(servers=["nats://a:4222", "nats://b:4222"])
         await adapter.connect()
@@ -181,7 +168,7 @@ class TestConnectHappyPath:
 
     @pytest.mark.asyncio
     async def test_connect_routes_context_through_load_context_options(
-        self, mock_synadia_agents, mock_nats, lock_granted, monkeypatch
+        self, mock_synadia_agents, mock_nats, monkeypatch
     ):
         # The SDK does NOT own NATS connections — the adapter calls
         # ``nats.connect(**sdk.load_context_options(name))`` directly.
@@ -208,7 +195,7 @@ class TestConnectHappyPath:
 
     @pytest.mark.asyncio
     async def test_connect_constructs_service_with_full_settings(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         adapter = _build_adapter(
             agent="hermes",
@@ -234,7 +221,7 @@ class TestConnectHappyPath:
 
     @pytest.mark.asyncio
     async def test_connect_derives_max_payload_from_broker_when_unset(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         # PR #41 alignment: when config.extra.max_payload is omitted,
         # the adapter must read nc.max_payload (the broker's negotiated
@@ -250,7 +237,7 @@ class TestConnectHappyPath:
 
     @pytest.mark.asyncio
     async def test_connect_passes_user_max_payload_through_unchanged(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         # When the user explicitly sets max_payload, hermes forwards it
         # untouched. The SDK clamps down at start() if the value is
@@ -265,7 +252,7 @@ class TestConnectHappyPath:
 
     @pytest.mark.asyncio
     async def test_connect_falls_back_to_1mb_when_broker_reports_zero(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         # Old nats-py builds didn't surface max_payload from the INFO
         # frame; the field defaults to 0. Match the SDK's own fallback
@@ -279,7 +266,7 @@ class TestConnectHappyPath:
 
     @pytest.mark.asyncio
     async def test_connect_registers_prompt_handler_before_start(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         adapter = _build_adapter()
         await adapter.connect()
@@ -302,16 +289,86 @@ class TestConnectHappyPath:
         start_idx = next(i for i, c in enumerate(all_calls) if c == call.start())
         assert on_prompt_idx < start_idx
 
+
+# ---------------------------------------------------------------------------
+# Identity liveness probe (warn-but-start)
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityLivenessProbe:
     @pytest.mark.asyncio
-    async def test_connect_acquires_scope_lock_with_identity(
-        self, mock_synadia_agents, mock_nats, lock_granted
+    async def test_clean_identity_starts_without_warning(
+        self, mock_synadia_agents, mock_nats, caplog
     ):
+        # Default mock_nats.request raises NoRespondersError → identity free.
+        adapter = _build_adapter()
+        with caplog.at_level(logging.WARNING):
+            assert await adapter.connect() is True
+
+        mock_synadia_agents.AgentService.return_value.start.assert_awaited_once()
+        assert not any("ALREADY LIVE" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_live_identity_warns_but_still_starts(
+        self, mock_synadia_agents, mock_nats, caplog
+    ):
+        # A reply means a live responder already owns this identity.
+        mock_nats.connect.return_value.request = AsyncMock(return_value=MagicMock())
+
         adapter = _build_adapter(agent="hermes", owner="rene", session_name="default")
+        with caplog.at_level(logging.WARNING):
+            ok = await adapter.connect()
+
+        # Warn-but-start: the gateway does NOT fail, it logs and continues.
+        assert ok is True
+        assert adapter.is_connected is True
+        assert adapter.has_fatal_error is False
+        mock_synadia_agents.AgentService.return_value.start.assert_awaited_once()
+
+        warnings = [r for r in caplog.records if "ALREADY LIVE" in r.message]
+        assert len(warnings) == 1
+        assert "hermes:rene:default" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_probe_runs_before_service_start(
+        self, mock_synadia_agents, mock_nats
+    ):
+        # The probe must complete before start() so its warning precedes
+        # the "Connected" log and the actual registration.
+        order: list[str] = []
+
+        async def _probe(*args, **kwargs):
+            order.append("probe")
+            raise mock_nats.errors.NoRespondersError()
+
+        mock_nats.connect.return_value.request = AsyncMock(side_effect=_probe)
+        service = mock_synadia_agents.AgentService.return_value
+        service.start.side_effect = lambda: order.append("start")
+
+        adapter = _build_adapter()
         await adapter.connect()
 
-        assert lock_granted["acquires"] == [
-            ("nats", "hermes:rene:default", {"platform": "nats"})
-        ]
+        assert order == ["probe", "start"]
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_does_not_block_startup(
+        self, mock_synadia_agents, mock_nats, caplog
+    ):
+        # Any non-classified probe error (broker hiccup, odd reply, etc.)
+        # must be swallowed — the probe is advisory, never a gate.
+        mock_nats.connect.return_value.request = AsyncMock(
+            side_effect=RuntimeError("probe boom")
+        )
+
+        adapter = _build_adapter()
+        with caplog.at_level(logging.WARNING):
+            ok = await adapter.connect()
+
+        assert ok is True
+        assert adapter.has_fatal_error is False
+        mock_synadia_agents.AgentService.return_value.start.assert_awaited_once()
+        # Inconclusive probe is debug-level, never an ALREADY-LIVE warning.
+        assert not any("ALREADY LIVE" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +379,7 @@ class TestConnectHappyPath:
 class TestConnectWithFatalInit:
     @pytest.mark.asyncio
     async def test_connect_short_circuits_when_config_was_invalid(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         adapter = NatsAdapter(PlatformConfig(enabled=True, extra={"owner": "rene"}))
         # _init_ already set a non-retryable fatal error.
@@ -330,47 +387,9 @@ class TestConnectWithFatalInit:
         assert adapter.fatal_error_retryable is False
 
         assert await adapter.connect() is False
-        # Must not touch the SDK or the lock table.
+        # Must not touch the SDK.
         mock_nats.connect.assert_not_called()
         mock_synadia_agents.AgentService.assert_not_called()
-        assert lock_granted["acquires"] == []
-
-
-# ---------------------------------------------------------------------------
-# Lock conflict
-# ---------------------------------------------------------------------------
-
-
-class TestLockConflict:
-    @pytest.mark.asyncio
-    async def test_conflict_reports_fatal_nonretryable_and_skips_sdk(
-        self, mock_synadia_agents, mock_nats, monkeypatch
-    ):
-        monkeypatch.setattr(
-            "gateway.status.acquire_scoped_lock",
-            lambda scope, identity, metadata=None: (False, {"pid": 9999}),
-        )
-        released: list[tuple] = []
-        monkeypatch.setattr(
-            "gateway.status.release_scoped_lock",
-            lambda scope, identity: released.append((scope, identity)),
-        )
-
-        adapter = _build_adapter()
-        ok = await adapter.connect()
-
-        assert ok is False
-        assert adapter.has_fatal_error is True
-        assert adapter.fatal_error_code == "nats_lock"
-        assert adapter.fatal_error_retryable is False
-        assert "already in use" in adapter.fatal_error_message
-        # When acquire fails, the SDK must not be touched at all.
-        mock_nats.connect.assert_not_called()
-        mock_synadia_agents.AgentService.assert_not_called()
-        # And release_scoped_lock must not have been called — we never
-        # owned the lock in the first place, so releasing would nuke the
-        # *other* process's record.
-        assert released == []
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +399,8 @@ class TestLockConflict:
 
 class TestConnectFailurePaths:
     @pytest.mark.asyncio
-    async def test_nats_connect_failure_marks_retryable_and_releases_lock(
-        self, mock_synadia_agents, mock_nats, lock_granted
+    async def test_nats_connect_failure_marks_retryable_and_no_handles(
+        self, mock_synadia_agents, mock_nats
     ):
         mock_nats.connect.side_effect = RuntimeError("boom")
 
@@ -393,16 +412,13 @@ class TestConnectFailurePaths:
         assert adapter.fatal_error_code == "nats_connect_error"
         assert adapter.fatal_error_retryable is True
         assert "boom" in adapter.fatal_error_message
-        # Lock must be returned on failure — otherwise the next retry
-        # attempt would self-conflict on the very same process.
-        assert lock_granted["releases"] == [("nats", "hermes:rene:default")]
         # No dangling service handle (we never even got to AgentService()).
         assert adapter._service is None
         assert adapter._nc is None
 
     @pytest.mark.asyncio
-    async def test_service_construction_failure_releases_and_closes_nc(
-        self, mock_synadia_agents, mock_nats, lock_granted
+    async def test_service_construction_failure_closes_nc(
+        self, mock_synadia_agents, mock_nats
     ):
         # nc connects fine, but AgentService(...) raises — common case
         # when the SDK's AgentSubject.new() rejects a sanitized but still
@@ -419,11 +435,10 @@ class TestConnectFailurePaths:
         mock_nats.connect.return_value.close.assert_awaited_once()
         assert adapter._nc is None
         assert adapter._service is None
-        assert lock_granted["releases"] == [("nats", "hermes:rene:default")]
 
     @pytest.mark.asyncio
     async def test_service_start_failure_stops_service_and_closes_nc(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         service = mock_synadia_agents.AgentService.return_value
         service.start.side_effect = RuntimeError("start failed")
@@ -441,7 +456,6 @@ class TestConnectFailurePaths:
         mock_nats.connect.return_value.close.assert_awaited_once()
         assert adapter._service is None
         assert adapter._nc is None
-        assert lock_granted["releases"] == [("nats", "hermes:rene:default")]
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +466,7 @@ class TestConnectFailurePaths:
 class TestDisconnect:
     @pytest.mark.asyncio
     async def test_disconnect_after_successful_connect_tears_down_in_order(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         adapter = _build_adapter()
         await adapter.connect()
@@ -478,12 +492,10 @@ class TestDisconnect:
         assert adapter._service is None
         assert adapter._nc is None
         assert adapter.is_connected is False
-        # Lock must be returned so the same profile can reconnect later.
-        assert lock_granted["releases"] == [("nats", "hermes:rene:default")]
 
     @pytest.mark.asyncio
     async def test_disconnect_is_idempotent_after_connect(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         adapter = _build_adapter()
         await adapter.connect()
@@ -498,7 +510,7 @@ class TestDisconnect:
 
     @pytest.mark.asyncio
     async def test_disconnect_without_connect_is_safe_noop(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         adapter = _build_adapter()
         await adapter.disconnect()
@@ -508,12 +520,10 @@ class TestDisconnect:
         mock_nats.connect.assert_not_called()
         mock_synadia_agents.AgentService.assert_not_called()
         assert adapter.is_connected is False
-        # No lock was acquired, so nothing to release.
-        assert lock_granted["releases"] == []
 
     @pytest.mark.asyncio
     async def test_disconnect_tolerates_service_stop_errors(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         adapter = _build_adapter()
         await adapter.connect()
@@ -524,15 +534,14 @@ class TestDisconnect:
         # after it.
         await adapter.disconnect()
 
-        # nc still closed; adapter handles cleared; lock still released.
+        # nc still closed; adapter handles cleared.
         mock_nats.connect.return_value.close.assert_awaited_once()
         assert adapter._service is None
         assert adapter._nc is None
-        assert lock_granted["releases"] == [("nats", "hermes:rene:default")]
 
     @pytest.mark.asyncio
     async def test_disconnect_cancels_in_flight_handlers(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         # A long-running handler parked on ``asyncio.sleep`` simulates
         # Phase 4's streaming body awaiting the next model delta when
@@ -565,14 +574,13 @@ class TestDisconnect:
         assert task.cancelled()
         assert adapter._in_flight_handlers == set()
         # Teardown must still run the full sequence after cancellation —
-        # stop, close, release lock.
+        # stop, close.
         mock_synadia_agents.AgentService.return_value.stop.assert_awaited_once()
         mock_nats.connect.return_value.close.assert_awaited_once()
-        assert lock_granted["releases"] == [("nats", "hermes:rene:default")]
 
     @pytest.mark.asyncio
     async def test_disconnect_sets_shutdown_event_before_stop(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         # Phase 4 handlers will gate their streaming loops on
         # ``self._shutdown_event`` — verify the event is set BEFORE the
@@ -595,7 +603,7 @@ class TestDisconnect:
 
     @pytest.mark.asyncio
     async def test_connect_rebuilds_session_lock_after_teardown(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         # The single-session lock collapses the v0.2 per-chat_id Lock
         # pool: a Lock held by a cancelled task wouldn't release cleanly,
@@ -611,7 +619,7 @@ class TestDisconnect:
 
     @pytest.mark.asyncio
     async def test_connect_clears_shutdown_event_on_retry(
-        self, mock_synadia_agents, mock_nats, lock_granted
+        self, mock_synadia_agents, mock_nats
     ):
         # After a prior teardown (connect failure or disconnect), the
         # shutdown event is set. A retry must clear it so Phase 4's
@@ -631,7 +639,7 @@ class TestDisconnect:
 
 
 class TestPlatformIdentity:
-    def test_adapter_reports_nats_platform(self, mock_synadia_agents, lock_granted):
+    def test_adapter_reports_nats_platform(self, mock_synadia_agents):
         adapter = _build_adapter()
         assert adapter.platform is Platform("nats")
 
@@ -642,7 +650,7 @@ class TestPlatformIdentity:
 
 
 @pytest.mark.asyncio
-async def test_connect_short_circuits_when_sdk_unavailable(monkeypatch, lock_granted):
+async def test_connect_short_circuits_when_sdk_unavailable(monkeypatch):
     """connect() short-circuits cleanly when the SDK isn't importable.
 
     Forces the ``SYNADIA_AGENTS_AVAILABLE = False`` branch (otherwise
@@ -653,7 +661,7 @@ async def test_connect_short_circuits_when_sdk_unavailable(monkeypatch, lock_gra
     adapter = _build_adapter()
     # Flip the in-module flag + zero out the SDK handles. This mirrors the
     # ImportError fallback at adapter.py top so the ``not SYNADIA_AGENTS_AVAILABLE``
-    # gate at adapter.py:517 fires.
+    # gate fires.
     monkeypatch.setattr(_nats_mod, "SYNADIA_AGENTS_AVAILABLE", False)
     monkeypatch.setattr(_nats_mod, "sdk", None)
     monkeypatch.setattr(_nats_mod, "sdk_svc", None)

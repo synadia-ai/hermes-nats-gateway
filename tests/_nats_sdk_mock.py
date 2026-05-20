@@ -8,6 +8,7 @@ bottom fires once per process; the function itself is idempotent.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
@@ -122,6 +123,18 @@ def _ensure_synadia_agents_mock() -> None:
         nats_mod = MagicMock()
         nats_mod.connect = AsyncMock()
         nats_mod.connect.return_value.close = AsyncMock()
+        # Real exception classes so the adapter's liveness-probe
+        # ``except (nats.errors.NoRespondersError, nats.errors.TimeoutError)``
+        # works — a MagicMock attribute can't be caught (not a BaseException).
+        # Mirror nats-py's real hierarchy: TimeoutError subclasses
+        # asyncio.TimeoutError.
+        nats_mod.errors = MagicMock()
+        nats_mod.errors.NoRespondersError = type(
+            "NoRespondersError", (Exception,), {}
+        )
+        nats_mod.errors.TimeoutError = type(
+            "TimeoutError", (asyncio.TimeoutError,), {}
+        )
         sys.modules["nats"] = nats_mod
 
 

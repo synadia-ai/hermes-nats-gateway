@@ -225,10 +225,10 @@ class NatsAdapterSettings:
 
     @property
     def identity(self) -> str:
-        """Stable lock identity ``{agent}:{owner}:{session_name}``.
+        """Stable identity ``{agent}:{owner}:{session_name}``.
 
-        Used by :meth:`NatsAdapter.connect` (Phase 3) to scope the
-        ``acquire_scoped_lock`` call per design doc §5.
+        Used in log lines (e.g. the liveness-probe warning in
+        :meth:`NatsAdapter.connect`) to name the agent triple succinctly.
         """
         return f"{self.agent}:{self.owner}:{self.session_name}"
 
@@ -482,15 +482,16 @@ class NatsAdapter(BasePlatformAdapter):
         """Open a NATS connection, register the service, and start heartbeats.
 
         Sequence (design doc §9 "Gateway startup"):
-          1. Acquire the machine-local scope lock
-             ``nats:{agent}:{owner}:{session_name}`` (§5) so two profiles
-             on one host can't shadow each other's registrations.
-          2. Open a NATS client via ``nats.connect(...)`` (the SDK does
+          1. Open a NATS client via ``nats.connect(...)`` (the SDK does
              NOT own connections — callers build the client and hand it
              to ``AgentService``). For ``servers`` we pass the list
              directly; for ``context`` we splat
              ``sdk.load_context_options(name)``. :class:`NatsAdapterSettings`
              already enforced the xor at init time.
+          2. Best-effort liveness probe: warn (but never fail) if this
+             identity already has a live responder anywhere on the server.
+             Duplicate identities load-balance prompts — the protocol
+             permits this for HA — so the gateway warns and starts anyway.
           3. Build the :class:`synadia_ai.agents.AgentService` with the
              resolved identity and §2.1 endpoint metadata (max_payload,
              attachments_ok) + §8.2 heartbeat cadence.
@@ -500,7 +501,7 @@ class NatsAdapter(BasePlatformAdapter):
              (prompt + status endpoints), advertises on ``$SRV.*``
              discovery subjects, and spawns the heartbeat publisher task.
 
-        Failures at any step roll back cleanly: the lock is released, any
+        Failures at any step roll back cleanly: any
         partially-constructed ``_service``/``_nc`` handles are torn down,
         and a retryable fatal error is recorded so ``gateway/run.py``
         queues another attempt 30 s later.
@@ -524,14 +525,6 @@ class NatsAdapter(BasePlatformAdapter):
             return False
 
         settings = self._settings
-
-        if not self._acquire_platform_lock(
-            "nats",
-            settings.identity,
-            f"NATS agent identity {settings.identity}",
-        ):
-            # _acquire_platform_lock already set the fatal error and logged.
-            return False
 
         try:
             # Reset shutdown signalling for this attempt so long-running
@@ -569,6 +562,11 @@ class NatsAdapter(BasePlatformAdapter):
                 resolved_max_payload = _format_max_payload_grammar(broker_bytes)
                 max_payload_origin = "server-negotiated"
 
+            # Warn (but never fail) if this identity is already live on the
+            # server — duplicates load-balance prompts. See the method for
+            # why this can't be a hard gate.
+            await self._warn_if_identity_already_live(settings)
+
             self._service = sdk_svc.AgentService(
                 agent=settings.agent,
                 owner=settings.owner,
@@ -598,7 +596,7 @@ class NatsAdapter(BasePlatformAdapter):
 
         except Exception as exc:
             # Best-effort teardown so the next retry starts from a clean
-            # slate. _teardown_handles releases the lock too.
+            # slate.
             await self._teardown_handles()
             self._set_fatal_error(
                 "nats_connect_error",
@@ -612,6 +610,43 @@ class NatsAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return False
+
+    async def _warn_if_identity_already_live(self, settings) -> None:
+        """Log a warning if this identity already has a live responder.
+
+        Best-effort and **warn-only**: the protocol intentionally permits
+        multiple instances per identity (HA / failover), so a duplicate is
+        not an error — prompts simply load-balance across instances via
+        NATS queue-group semantics. This probe therefore never raises and
+        never blocks startup; a request to the SDK's own status subject is
+        the cheapest live-responder oracle the transport offers.
+
+        ``NoRespondersError`` returns immediately when the identity is free,
+        so the clean path costs ~0 ms; only a genuine live responder (or a
+        stalled server) pays up to the 1 s timeout.
+        """
+        # Build the subject via the SDK so non-conforming owner/session
+        # tokens get the same base64-url sanitization AgentService applies —
+        # a hand-built f-string could miss a real responder.
+        status_subject = sdk.AgentSubject.new(
+            settings.agent, settings.owner, settings.session_name
+        ).status
+        try:
+            await self._nc.request(status_subject, b"", timeout=1.0)
+        except (nats.errors.NoRespondersError, nats.errors.TimeoutError, asyncio.TimeoutError):
+            return  # nobody home — identity is free
+        except Exception as exc:
+            logger.debug(
+                "[%s] identity liveness probe inconclusive: %s", self.name, exc
+            )
+            return  # probe failure must not block startup
+        logger.warning(
+            "[%s] identity %s is ALREADY LIVE on this NATS server — prompts will "
+            "load-balance across both instances. If unintended, give this profile "
+            "a distinct HERMES_NATS_SESSION_NAME.",
+            self.name,
+            settings.identity,
+        )
 
     async def disconnect(self) -> None:
         """Stop the agent, close the NATS client, and release the lock.
@@ -639,8 +674,6 @@ class NatsAdapter(BasePlatformAdapter):
              still open so the heartbeat task's final iteration can
              cleanly bail out instead of racing the socket close.
           3. ``nc.close()`` — drops the underlying NATS connection.
-          4. Release the scoped lock so the next gateway instance on
-             this host can register the same identity.
         """
         # Step 1 — drain in-flight prompt handlers. Materialize the
         # pending list first: ``cancel()`` schedules CancelledError at
@@ -690,8 +723,6 @@ class NatsAdapter(BasePlatformAdapter):
                 )
             finally:
                 self._nc = None
-
-        self._release_platform_lock()
 
     # ------------------------------------------------------------------
     # Inbound prompt handler — Phase 4
@@ -2002,11 +2033,12 @@ def _find_nats_profile_collisions(
 ) -> list[dict]:
     """Return metadata for OTHER profiles whose NATS triple collides with ours.
 
-    The NATS adapter takes a scoped lock on ``{agent}:{owner}:{session_name}``
-    (see :class:`NatsAdapter`), so two
-    profiles sharing a triple cannot run their gateways simultaneously — one
-    will fail to acquire the lock at startup.  The wizard catches that at
-    config time instead of leaving the user to debug a startup crash.
+    Two profiles sharing ``{agent}:{owner}:{session_name}`` will both
+    register on the same subjects and load-balance prompts across each
+    other (NATS queue-group semantics). The protocol permits this for HA,
+    so it isn't fatal — but a same-host duplicate is usually a mistake. The
+    wizard surfaces it at config time so the user can pick a distinct
+    ``session_name`` before being surprised by duplicated prompts.
 
     Sibling profiles may configure NATS via either ``.env`` (the wizard's
     output, mirroring every other Hermes platform) or by hand-editing
@@ -2129,6 +2161,7 @@ def interactive_setup() -> None:
         print_info,
         print_success,
         print_error,
+        print_warning,
     )
 
     print_header("NATS")
@@ -2191,18 +2224,19 @@ def interactive_setup() -> None:
 
     agent = get_env_value("HERMES_NATS_AGENT") or DEFAULT_AGENT
 
-    # ── Cross-profile lock-collision check ──
+    # ── Cross-profile identity-collision check (warn, don't block) ──
     conflicts = _find_nats_profile_collisions(agent, owner, session)
     if conflicts:
         print()
-        print_error(
-            f"NATS lock collision: {agent}:{owner}:{session} is already used by "
-            "another profile."
+        print_warning(
+            f"Another profile already uses {agent}:{owner}:{session}."
         )
         print_info(
-            "Each profile must have a unique (agent, owner, session_name) triple — "
-            "the NATS adapter takes a scoped lock on that triple, so two profiles "
-            "sharing it cannot run their gateways simultaneously."
+            "Two instances sharing an (agent, owner, session_name) triple "
+            "load-balance prompts across each other (and prompts look "
+            "duplicated). The protocol allows this for high availability, so "
+            "it isn't blocked — but if it's unintended, give each profile a "
+            "distinct session_name."
         )
         print()
         for c in conflicts:
@@ -2212,11 +2246,6 @@ def interactive_setup() -> None:
             )
             print_info(f"    config: {c['path']}")
         print()
-        print_info(
-            "Re-run 'hermes setup gateway' (or 'hermes -p <name> setup gateway') "
-            "with a different owner or session_name."
-        )
-        return
 
     # ── Commit to .env ──
     # Write the chosen transport and blank the other so re-config can swap
