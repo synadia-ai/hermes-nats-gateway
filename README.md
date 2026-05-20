@@ -2,7 +2,7 @@
 
 Expose [Hermes Agent](https://github.com/NousResearch/hermes-agent) on
 [NATS](https://nats.io/) using the **Synadia Agent Protocol for NATS v0.3** —
-a programmatic, request/reply transport with streamed responses.
+a request/reply transport with streamed responses.
 
 [![tests](https://github.com/synadia-ai/hermes-nats-gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/synadia-ai/hermes-nats-gateway/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
@@ -13,20 +13,18 @@ a programmatic, request/reply transport with streamed responses.
 `hermes-nats-gateway` is an **out-of-tree platform plugin** for Hermes Agent. You
 install it once with the Hermes plugin CLI, and the NATS transport becomes
 available to every Hermes session alongside the built-in chat platforms
-(Telegram / Discord / Slack). Nothing in upstream Hermes changes — the plugin
-attaches through the public `hermes_agent.plugins` entry point and the
-`send_exec_approval` adapter hook present in Hermes **v0.14.0+**.
+(Telegram / Discord / Slack). Nothing in upstream Hermes changes, and it
+requires Hermes **v0.14.0+**.
 
-Unlike the chat platforms, callers on NATS are *programs*, not people. A caller
-publishes a prompt to a well-known subject and iterates the streamed response
-back. The gateway appears on NATS as a micro-service at
-`agents.prompt.<agent>.<owner>.<session_name>`, with heartbeats, an
-`agents.status` request endpoint, `$SRV.PING` discovery, and mid-stream
-dangerous-command approval queries. There is no chat UI and no user allowlist —
-authorization is delegated to the NATS server layer (accounts / NKey / JWT /
-TLS), the same model Hermes already uses for Webhooks (HMAC) and Home Assistant.
-Use it to reach Hermes from other services, embed the agent into an
-event-driven pipeline, or have one agent call another over NATS. The protocol
+Instead of a chat UI, the gateway appears on NATS as a micro-service at
+`agents.prompt.<agent>.<owner>.<session_name>` — with heartbeats, an
+`agents.status` endpoint, discovery, and mid-stream dangerous-command approval.
+People usually reach it through an application or UI that talks to NATS under
+the hood; you can also use it to connect Hermes to other services, plug the
+agent into an event-driven pipeline, or have one agent call another over NATS.
+
+Authorization is handled by the NATS server (accounts / NKey / JWT / TLS) — the
+same model Hermes already uses for Webhooks and Home Assistant. The protocol
 spec lives at
 [`synadia-ai/synadia-agent-sdk-docs`](https://github.com/synadia-ai/synadia-agent-sdk-docs/blob/main/core-protocol.md).
 
@@ -176,15 +174,13 @@ platforms:
 If you manage NATS credentials via `nats context`, set `NATS_CONTEXT` (env) or
 `extra.context` (yaml) instead of `NATS_URL` / `extra.servers`.
 
-> **Prefer the `.env` / wizard path over YAML-only `extra` keys.** On stock Hermes
-> the gateway config is built by a `from_dict()` pass followed by a separate
-> per-platform enable loop (`gateway/config.py` around lines 585–595 and 1832).
-> Because of that ordering, values set *only* under `gateway.platforms.nats.extra`
-> in `config.yaml` can be dropped before the adapter sees them, while the same
-> values supplied through `.env` (or written by the wizard) survive. This is
-> upstream-Hermes behavior, not a plugin bug — but until it's fixed upstream, set
-> identity/transport via `.env`/wizard and treat `extra` as best-effort tuning
-> only.
+> **Set identity and transport via `.env` or the wizard, not YAML alone.** Because
+> of how upstream Hermes loads its config, values placed *only* under
+> `gateway.platforms.nats.extra` in `config.yaml` can be dropped before the gateway
+> sees them — while the same values in `.env` (or written by the wizard) always
+> take effect. This is upstream-Hermes behavior, not a plugin bug. Until it's fixed
+> upstream, keep identity and transport (owner, session, URL/context) in `.env` or
+> the wizard, and treat the `extra` block as best-effort tuning only.
 
 ## Multiple sessions (profiles)
 
@@ -310,8 +306,10 @@ Reply with one of four tokens (case-insensitive; common synonyms accepted):
 | `deny` | `d`, `no`, `n`, `nope`, `reject`, `cancel`, `stop`, `block`, `0` | Reject the command |
 
 Anything unrecognized, empty, or no answer at all falls through to **`deny`** —
-fail-safe matches Hermes's "no answer ⇒ blocked" policy. See
-`examples/04-query-reply.py` for the caller side.
+fail-safe matches Hermes's "no answer ⇒ blocked" policy. For a worked example of
+the caller side, see `04-query-reply.py` in the
+[client SDK repo](https://github.com/synadia-ai/synadia-agents)
+(`client-sdk/python/examples/`).
 
 ## Limitations
 
@@ -365,9 +363,10 @@ or query `agents.status.hermes.<owner>.<session_name>` directly.
 
 **A dangerous command hangs for ~5 minutes then is denied**
 The caller isn't handling the approval `query` frame, so the gateway's
-`gateway_timeout` (default 300 s) elapses and the command is denied. Drain the
-prompt stream's async iterator and answer query frames — see
-`examples/04-query-reply.py`.
+`gateway_timeout` (default 300 s) elapses and the command is denied. The caller
+must read query frames as they arrive and reply to them — see `04-query-reply.py`
+in the [client SDK repo](https://github.com/synadia-ai/synadia-agents)
+(`client-sdk/python/examples/`).
 
 ## Development
 
