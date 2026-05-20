@@ -1904,44 +1904,95 @@ def _final_response_text(result: Any) -> str:
 
 
 def check_requirements() -> bool:
-    """Return ``True`` iff NATS is both installable and env-enabled.
+    """Return ``True`` iff NATS is installable AND completely configured.
 
-    The generic-plugin interface uses ``check_fn`` for two jobs:
+    The generic-plugin interface uses ``check_fn`` for three jobs:
 
-      1. Gating adapter instantiation in ``_create_adapter`` — "are the
-         runtime deps available?" (the original meaning of the verbatim
-         ``check_nats_requirements`` above).
+      1. Gating adapter instantiation in ``platform_registry.create_adapter``
+         — "are the runtime deps available?"
       2. Gating env-driven enablement in ``_apply_env_overrides`` (config.py
-         L1862-1872) — when ``check_fn()`` returns True the platform is
+         L1879-1889) — when ``check_fn()`` returns True the platform is
          auto-enabled.
+      3. As the fall-back "is this platform configured?" probe in the setup UI
+         (``hermes_cli/gateway.py::_platform_status`` consults ``check_fn``
+         when ``is_connected`` is False).
 
-    Mirroring IRC's pattern (see ``plugins/platforms/irc/adapter.py:520-525``),
-    we require BOTH SDK availability AND at least one NATS env var to be
-    set, so that "just installed, never configured" does not silently
-    auto-enable NATS in every gateway start.  Matches the gate used by the
-    legacy ``gateway/config.py::_apply_env_overrides`` NATS block (any of
-    NATS_URL / NATS_CONTEXT / HERMES_NATS_AGENT / HERMES_NATS_OWNER /
-    HERMES_NATS_SESSION_NAME) — Stage 3 removes that legacy block.
+    Because of (3), ``check_fn`` must mean **ready to connect**, not merely
+    "some NATS var is set": require the SDKs *and* a complete, connectable
+    config — a transport (``NATS_URL`` XOR ``NATS_CONTEXT``) plus
+    ``HERMES_NATS_OWNER`` and ``HERMES_NATS_SESSION_NAME``.
+
+    This supersedes the 2026-04-21 "enable on any NATS var, validate narrowly"
+    decision.  Enabling a config that provably can't connect made
+    ``_platform_status`` mislabel a half-config (owner+session, no transport)
+    as "configured" — so the setup checklist pre-selected and skipped it, the
+    transport never got set — and the gateway logged an ``ERROR`` for the
+    doomed adapter on every start.  A half-config now reads as "not configured"
+    everywhere and is diagnosed once (see ``_diagnose_incomplete_nats``)
+    instead of enabled-and-broken.
     """
     if not check_nats_requirements():
+        # Missing SDKs is a distinct failure with its own ``install_hint``;
+        # don't muddy it with the config diagnostic.
         return False
-    return any(
-        os.environ.get(var, "").strip()
-        for var in (
-            "NATS_URL",
-            "NATS_CONTEXT",
-            "HERMES_NATS_AGENT",
-            "HERMES_NATS_OWNER",
-            "HERMES_NATS_SESSION_NAME",
-        )
-    )
+    has_url = bool(os.environ.get("NATS_URL", "").strip())
+    has_ctx = bool(os.environ.get("NATS_CONTEXT", "").strip())
+    owner = bool(os.environ.get("HERMES_NATS_OWNER", "").strip())
+    session = bool(os.environ.get("HERMES_NATS_SESSION_NAME", "").strip())
+    if (has_url != has_ctx) and owner and session:
+        return True
+    _diagnose_incomplete_nats(has_url, has_ctx, owner, session)
+    return False
 
 
-# Set once we've logged the transport-gap diagnostic, so a misconfigured
+# Set once we've logged the incomplete-config diagnostic, so a misconfigured
 # profile explains itself exactly once per process instead of on every
-# ``validate_config`` call (the registry calls it at adapter creation, and
-# ``is_connected`` calls it again whenever status is rendered).
-_transport_diagnostic_emitted = False
+# ``check_requirements`` / ``validate_config`` call (the registry calls these
+# at enablement and adapter creation, and ``is_connected`` calls validate again
+# whenever status is rendered).
+_config_diagnostic_emitted = False
+
+
+def _diagnose_incomplete_nats(
+    has_url: bool, has_ctx: bool, owner: bool, session: bool
+) -> None:
+    """Log one precise, actionable warning for a partial NATS config.
+
+    Called from both ``check_requirements`` (env-only enablement gate) and
+    ``validate_config`` (env + config.yaml; adapter creation / status) so a
+    half-config is explained once per process no matter which gate trips
+    first.  The registry only logs a generic "config validation failed" /
+    "requirements not met", which is easily misread as a missing-SDK problem;
+    these messages name exactly what's missing and stress it is *not* a
+    dependency issue.
+    """
+    global _config_diagnostic_emitted
+    # Stay silent for a profile that simply isn't using NATS.
+    if not (has_url or has_ctx or owner or session):
+        return
+    if _config_diagnostic_emitted:
+        return
+    _config_diagnostic_emitted = True
+    if has_url and has_ctx:
+        logger.warning(
+            "NATS: both NATS_URL and NATS_CONTEXT are set, but exactly one "
+            "transport is allowed. Unset one — e.g. run 'hermes setup gateway' "
+            "(or 'hermes -p <profile> setup gateway')."
+        )
+    elif not (has_url or has_ctx):
+        logger.warning(
+            "NATS: identity is set (owner/session) but no transport is "
+            "configured, so the adapter cannot start. Set NATS_URL or "
+            "NATS_CONTEXT — e.g. run 'hermes setup gateway' (or "
+            "'hermes -p <profile> setup gateway'). The SDKs are present; this "
+            "is a configuration gap, not a missing dependency."
+        )
+    else:
+        logger.warning(
+            "NATS: a transport is set but the identity is incomplete — set "
+            "both HERMES_NATS_OWNER and HERMES_NATS_SESSION_NAME. e.g. run "
+            "'hermes setup gateway' (or 'hermes -p <profile> setup gateway')."
+        )
 
 
 def validate_config(config) -> bool:
@@ -1954,46 +2005,22 @@ def validate_config(config) -> bool:
 
     Reads env vars as a fallback so env-only setups (no ``config.yaml``)
     validate the same way the gateway's ``_apply_env_overrides`` materializes
-    them.
-
-    When validation fails because a transport is missing or ambiguous — the
-    common case for a profile configured only via ``required_env`` (owner +
-    session, no ``NATS_URL`` / ``NATS_CONTEXT``) — emit a precise, actionable
-    warning. The registry only logs a generic "config validation failed",
-    which is easily misread as a missing-SDK problem; this says exactly what's
-    wrong and that it is *not* a dependency issue.
+    them.  On failure, emits a one-time diagnostic via
+    ``_diagnose_incomplete_nats`` so the precise gap is logged rather than only
+    the registry's generic "config validation failed".
     """
     extra = getattr(config, "extra", {}) or {}
     has_url = bool(os.getenv("NATS_URL", "").strip()) or bool(extra.get("servers"))
     has_ctx = bool(os.getenv("NATS_CONTEXT", "").strip()) or bool(extra.get("context"))
-    owner = os.getenv("HERMES_NATS_OWNER", "").strip() or extra.get("owner", "")
-    session = (
+    owner = bool(os.getenv("HERMES_NATS_OWNER", "").strip() or extra.get("owner", ""))
+    session = bool(
         os.getenv("HERMES_NATS_SESSION_NAME", "").strip()
         or extra.get("session_name", "")
     )
-    if has_url == has_ctx:  # both set or neither set → invalid (XOR)
-        # Only diagnose when the user has clearly *started* configuring NATS
-        # (identity present); a wholly-unconfigured profile isn't using NATS
-        # and should stay silent.
-        global _transport_diagnostic_emitted
-        if (owner or session) and not _transport_diagnostic_emitted:
-            _transport_diagnostic_emitted = True
-            if has_url and has_ctx:
-                logger.warning(
-                    "NATS: both NATS_URL and NATS_CONTEXT are set, but exactly "
-                    "one transport is allowed. Unset one — e.g. run "
-                    "'hermes setup gateway' (or 'hermes -p <profile> setup gateway')."
-                )
-            else:
-                logger.warning(
-                    "NATS: identity is set (owner/session) but no transport is "
-                    "configured, so the adapter cannot start. Set NATS_URL or "
-                    "NATS_CONTEXT — e.g. run 'hermes setup gateway' (or "
-                    "'hermes -p <profile> setup gateway'). The SDKs are present; "
-                    "this is a configuration gap, not a missing dependency."
-                )
-        return False
-    return bool(owner and session)
+    if (has_url != has_ctx) and owner and session:
+        return True
+    _diagnose_incomplete_nats(has_url, has_ctx, owner, session)
+    return False
 
 
 def is_connected(config) -> bool:
