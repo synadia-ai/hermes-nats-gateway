@@ -10,7 +10,10 @@
 #   bash install-sdks.sh /path/to/venv/bin/python   # or pass it explicitly
 set -euo pipefail
 
-SDKS=(synadia-ai-agents synadia-ai-agent-service nkeys)
+# Keep the git-installed plugin on the exact SDK pair it was validated with.
+# Keep nkeys explicit because older plugin releases documented it as a direct
+# runtime prerequisite, even though the client SDK also pulls it transitively.
+SDKS=(synadia-ai-agents==0.8.0 synadia-ai-agent-service==0.5.0 nkeys==0.2.1)
 
 err() { printf 'error: %s\n' "$*" >&2; exit 1; }
 

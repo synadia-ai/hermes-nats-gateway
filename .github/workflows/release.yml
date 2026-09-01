@@ -15,7 +15,9 @@ jobs:
         run: |
           set -ex
           TAG="${GITHUB_REF_NAME#v}"
-          uv sync
+          # A tag must not silently refresh the stale branch-stage lock. This
+          # remains closed until the released SDKs are recorded in uv.lock.
+          uv sync --locked
           PY=$(uv run python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
           PL=$(uv run python -c 'import yaml; print(yaml.safe_load(open("plugin.yaml"))["version"])')
           if [ "$TAG" != "$PY" ] || [ "$TAG" != "$PL" ]; then

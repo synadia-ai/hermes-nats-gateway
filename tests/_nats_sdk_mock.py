@@ -41,14 +41,29 @@ def _ensure_synadia_agents_mock() -> None:
     )
 
     if not need_client_mock and not need_agent_service_mock:
-        return  # Both real SDKs are installed — nothing to mock
+        # Older published SDKs may be installed in the test environment.
+        # Add only the new public seam so requirements/config tests exercise
+        # this gateway without replacing either real module wholesale.
+        client_mod = sys.modules["synadia_ai.agents"]
+        service_mod = sys.modules["synadia_ai.agent_service"]
+        if not hasattr(client_mod, "resolve_nats_connection_bundle"):
+            bundle = MagicMock()
+            bundle.connection_options = {"servers": ["nats://stub:4222"]}
+            bundle.signer = MagicMock(name="connection_signer")
+            bundle.wipe = MagicMock()
+            client_mod.resolve_nats_connection_bundle = MagicMock(return_value=bundle)
+        if not hasattr(service_mod, "ServiceIdentity"):
+            service_mod.ServiceIdentity = MagicMock()
+        return
 
     if need_client_mock:
         mod = MagicMock()
 
-        # Context-options helper that the adapter uses for the `context` path
-        # (no return shape needed beyond "a dict that splats into nats.connect").
-        mod.load_context_options = MagicMock(return_value={"servers": ["nats://stub:4222"]})
+        bundle = MagicMock()
+        bundle.connection_options = {"servers": ["nats://stub:4222"]}
+        bundle.signer = MagicMock(name="connection_signer")
+        bundle.wipe = MagicMock()
+        mod.resolve_nats_connection_bundle = MagicMock(return_value=bundle)
 
         # Real exception classes so ``except sdk.QueryTimeout`` works.
         mod.QueryTimeout = type("QueryTimeout", (Exception,), {})
@@ -98,6 +113,7 @@ def _ensure_synadia_agents_mock() -> None:
         agent_service_mod.AgentService = MagicMock()
         agent_service_mod.AgentService.return_value.start = AsyncMock()
         agent_service_mod.AgentService.return_value.stop = AsyncMock()
+        agent_service_mod.ServiceIdentity = MagicMock()
         agent_service_mod.PromptStream = MagicMock()
         agent_service_mod.PromptHandler = MagicMock  # forward-looking; hermes never imports it
     else:

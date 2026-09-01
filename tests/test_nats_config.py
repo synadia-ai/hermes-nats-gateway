@@ -69,8 +69,17 @@ def _isolate_nats_env(monkeypatch):
     ``_hermetic_environment`` blanks credential-shaped vars but not
     NATS_*, and scripts/run_tests.sh's unset list also omits them.
     """
-    for name in ("NATS_URL", "NATS_CONTEXT", "HERMES_NATS_AGENT",
-                 "HERMES_NATS_OWNER", "HERMES_NATS_SESSION_NAME"):
+    for name in (
+        "NATS_URL",
+        "NATS_CONTEXT",
+        "NATS_CREDS",
+        "NATS_NKEY",
+        "NATS_SENDER_IDENTITY",
+        "NATS_MIN_SENDER_TRUST",
+        "HERMES_NATS_AGENT",
+        "HERMES_NATS_OWNER",
+        "HERMES_NATS_SESSION_NAME",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -91,6 +100,10 @@ class TestSettingsFromExtraHappy:
 
         assert settings.servers == ["nats://127.0.0.1:4222"]
         assert settings.context is None
+        assert settings.creds is None
+        assert settings.nkey is None
+        assert settings.sender_identity == "off"
+        assert settings.min_sender_trust == "any"
         assert settings.agent == DEFAULT_AGENT
         assert settings.owner == "rene"
         assert settings.session_name == "default"
@@ -126,6 +139,9 @@ class TestSettingsFromExtraHappy:
                 "max_payload": "2MB",
                 "attachments_ok": False,
                 "ack_keepalive_interval_s": 30,
+                "creds": "/run/secrets/hermes.creds",
+                "sender_identity": "signed",
+                "min_sender_trust": "signed",
             }
         )
 
@@ -137,6 +153,10 @@ class TestSettingsFromExtraHappy:
         assert settings.max_payload == "2MB"
         assert settings.attachments_ok is False
         assert settings.ack_keepalive_interval_s == 30
+        assert settings.creds == "/run/secrets/hermes.creds"
+        assert settings.nkey is None
+        assert settings.sender_identity == "signed"
+        assert settings.min_sender_trust == "signed"
 
     def test_servers_string_is_coerced_to_single_url_list(self):
         settings = NatsAdapterSettings.from_extra(
@@ -215,6 +235,47 @@ class TestSettingsFromExtraHappy:
 
 
 class TestSettingsFromExtraBad:
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("sender_identity", "auto"),
+            ("min_sender_trust", "verified"),
+        ],
+    )
+    def test_invalid_identity_choices_raise(self, field, value):
+        with pytest.raises(NatsConfigError, match=field):
+            NatsAdapterSettings.from_extra(
+                {
+                    "servers": ["nats://x:4222"],
+                    "owner": "rene",
+                    "session_name": "default",
+                    field: value,
+                }
+            )
+
+    def test_creds_and_nkey_are_mutually_exclusive(self):
+        with pytest.raises(NatsConfigError, match="not both"):
+            NatsAdapterSettings.from_extra(
+                {
+                    "servers": ["nats://x:4222"],
+                    "creds": "/alice.creds",
+                    "nkey": "/alice.nk",
+                    "owner": "rene",
+                    "session_name": "default",
+                }
+            )
+
+    def test_context_rejects_separate_url_credentials(self):
+        with pytest.raises(NatsConfigError, match="cannot accompany 'context'"):
+            NatsAdapterSettings.from_extra(
+                {
+                    "context": "prod",
+                    "creds": "/alice.creds",
+                    "owner": "rene",
+                    "session_name": "default",
+                }
+            )
+
     def test_missing_transport_raises(self):
         with pytest.raises(NatsConfigError, match="exactly one of 'servers'"):
             NatsAdapterSettings.from_extra(
@@ -455,6 +516,10 @@ class TestNatsEnvOverrides:
         base = {
             "NATS_URL": "",
             "NATS_CONTEXT": "",
+            "NATS_CREDS": "",
+            "NATS_NKEY": "",
+            "NATS_SENDER_IDENTITY": "",
+            "NATS_MIN_SENDER_TRUST": "",
             "HERMES_NATS_AGENT": "",
             "HERMES_NATS_OWNER": "",
             "HERMES_NATS_SESSION_NAME": "",
@@ -509,6 +574,23 @@ class TestNatsEnvOverrides:
         assert extra["agent"] == "hermes"
         assert extra["owner"] == "rene"
         assert extra["session_name"] == "default"
+
+    def test_plugin_env_hook_populates_credentials_and_identity_modes(self):
+        env = self._nats_env(
+            NATS_URL="nats://127.0.0.1:4222",
+            HERMES_NATS_OWNER="rene",
+            HERMES_NATS_SESSION_NAME="default",
+            NATS_CREDS="/run/secrets/hermes.creds",
+            NATS_SENDER_IDENTITY="signed",
+            NATS_MIN_SENDER_TRUST="signed",
+        )
+        with patch.dict(os.environ, env, clear=True):
+            seed = _nats_mod._env_enablement()
+
+        assert seed is not None
+        assert seed["creds"] == "/run/secrets/hermes.creds"
+        assert seed["sender_identity"] == "signed"
+        assert seed["min_sender_trust"] == "signed"
 
     def test_transport_only_does_not_enable(self):
         # Supersedes the 2026-04-21 "enable on any NATS var" decision: a

@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -72,9 +73,9 @@ def mock_synadia_agents(monkeypatch):
     tests; without a fresh reset ``call_args`` from one test bleeds into
     the next and assertions become order-dependent.
 
-    After the v0.5 client / v0.1 agent SDK split, ``AgentService`` lives
+    After the client / agent SDK split, ``AgentService`` lives
     in ``synadia_ai.agent_service`` and the wire types
-    (``load_context_options`` etc.) live in ``synadia_ai.agents``. The
+    (including the connection-bundle resolver) live in ``synadia_ai.agents``. The
     returned proxy exposes ``AgentService`` from the agent_service module
     so existing test assertions (``mock_synadia_agents.AgentService...``)
     keep working transparently.
@@ -92,20 +93,26 @@ def mock_synadia_agents(monkeypatch):
     # MagicMock so assert_called_once_with works without await semantics.
     service_instance.on_prompt = MagicMock()
     svc_mod.AgentService = MagicMock(return_value=service_instance)
+    svc_mod.ServiceIdentity = MagicMock()
 
-    # ``load_context_options`` translates a `nats` context name → kwargs
-    # for nats.connect. The adapter splats the result.
-    client_mod.load_context_options = MagicMock(return_value={"servers": ["nats://stub:4222"]})
+    bundle = MagicMock()
+    bundle.connection_options = {"servers": ["nats://stub:4222"]}
+    bundle.signer = MagicMock(name="connection_signer")
+    bundle.wipe = MagicMock()
+    client_mod.resolve_nats_connection_bundle = MagicMock(return_value=bundle)
 
     # Proxy that surfaces AgentService from agent_service while keeping
     # the wire-type attributes accessible for existing tests.
     class _SdkProxy:
         AgentService = svc_mod.AgentService
-        load_context_options = client_mod.load_context_options
+        ServiceIdentity = svc_mod.ServiceIdentity
+        resolve_nats_connection_bundle = client_mod.resolve_nats_connection_bundle
         agents = client_mod
         agent_service = svc_mod
 
-    return _SdkProxy()
+    proxy = _SdkProxy()
+    proxy.bundle = bundle
+    return proxy
 
 
 @pytest.fixture
@@ -156,25 +163,27 @@ class TestConnectHappyPath:
         assert adapter._service is mock_synadia_agents.AgentService.return_value
 
     @pytest.mark.asyncio
-    async def test_connect_passes_servers_to_nats_connect(
+    async def test_connect_routes_servers_through_connection_bundle(
         self, mock_synadia_agents, mock_nats
     ):
         adapter = _build_adapter(servers=["nats://a:4222", "nats://b:4222"])
         await adapter.connect()
 
-        mock_nats.connect.assert_awaited_once()
-        kwargs = mock_nats.connect.await_args.kwargs
-        assert kwargs == {"servers": ["nats://a:4222", "nats://b:4222"]}
+        mock_synadia_agents.resolve_nats_connection_bundle.assert_called_once_with(
+            url="nats://a:4222,nats://b:4222",
+            creds=None,
+            nkey=None,
+            identity="off",
+        )
+        mock_nats.connect.assert_awaited_once_with(
+            **mock_synadia_agents.bundle.connection_options
+        )
 
     @pytest.mark.asyncio
-    async def test_connect_routes_context_through_load_context_options(
+    async def test_connect_routes_context_through_connection_bundle(
         self, mock_synadia_agents, mock_nats, monkeypatch
     ):
-        # The SDK does NOT own NATS connections — the adapter calls
-        # ``nats.connect(**sdk.load_context_options(name))`` directly.
-        # Verify the context name is forwarded to the SDK helper and the
-        # resulting kwargs are splatted into nats.connect.
-        mock_synadia_agents.load_context_options.return_value = {
+        mock_synadia_agents.bundle.connection_options = {
             "servers": ["nats://prod:4222"],
             "user_credentials": "/secret/creds",
         }
@@ -186,12 +195,87 @@ class TestConnectHappyPath:
         )
         await adapter.connect()
 
-        mock_synadia_agents.load_context_options.assert_called_once_with("prod-nats")
+        mock_synadia_agents.resolve_nats_connection_bundle.assert_called_once_with(
+            context="prod-nats", identity="off"
+        )
         mock_nats.connect.assert_awaited_once()
         assert mock_nats.connect.await_args.kwargs == {
             "servers": ["nats://prod:4222"],
             "user_credentials": "/secret/creds",
         }
+
+    @pytest.mark.asyncio
+    async def test_signed_identity_uses_the_connection_bundle_signer(
+        self, mock_synadia_agents, mock_nats
+    ):
+        adapter = _build_adapter(
+            sender_identity="signed",
+            min_sender_trust="any",
+        )
+        await adapter.connect()
+
+        mock_synadia_agents.resolve_nats_connection_bundle.assert_called_once_with(
+            url="nats://127.0.0.1:4222",
+            creds=None,
+            nkey=None,
+            identity="signed",
+        )
+        mock_synadia_agents.ServiceIdentity.assert_called_once_with(
+            signer=mock_synadia_agents.bundle.signer
+        )
+        kwargs = mock_synadia_agents.AgentService.call_args.kwargs
+        assert kwargs["identity"] is mock_synadia_agents.ServiceIdentity.return_value
+        assert kwargs["min_sender_trust"] == "any"
+
+    @pytest.mark.asyncio
+    async def test_url_creds_are_connection_credentials_not_a_second_signer_source(
+        self, mock_synadia_agents, mock_nats
+    ):
+        adapter = _build_adapter(
+            creds="/run/secrets/hermes.creds",
+            sender_identity="signed",
+        )
+        await adapter.connect()
+
+        mock_synadia_agents.resolve_nats_connection_bundle.assert_called_once_with(
+            url="nats://127.0.0.1:4222",
+            creds="/run/secrets/hermes.creds",
+            nkey=None,
+            identity="signed",
+        )
+        mock_synadia_agents.ServiceIdentity.assert_called_once_with(
+            signer=mock_synadia_agents.bundle.signer
+        )
+
+    @pytest.mark.asyncio
+    async def test_signed_mode_never_degrades_if_bundle_has_no_signer(
+        self, mock_synadia_agents, mock_nats
+    ):
+        mock_synadia_agents.bundle.signer = None
+        adapter = _build_adapter(sender_identity="signed")
+
+        assert await adapter.connect() is False
+
+        mock_nats.connect.assert_not_awaited()
+        mock_synadia_agents.AgentService.assert_not_called()
+        mock_synadia_agents.bundle.wipe.assert_called_once_with()
+        assert adapter._connection_bundle is None
+        assert adapter.fatal_error_message == "NATS connect failed (RuntimeError)"
+
+    @pytest.mark.asyncio
+    async def test_identity_off_and_signed_min_trust_are_independent(
+        self, mock_synadia_agents, mock_nats
+    ):
+        adapter = _build_adapter(
+            sender_identity="off",
+            min_sender_trust="signed",
+        )
+        await adapter.connect()
+
+        kwargs = mock_synadia_agents.AgentService.call_args.kwargs
+        assert "identity" not in kwargs
+        assert kwargs["min_sender_trust"] == "signed"
+        mock_synadia_agents.ServiceIdentity.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_connect_constructs_service_with_full_settings(
@@ -216,6 +300,8 @@ class TestConnectHappyPath:
         assert kwargs["heartbeat_interval_s"] == 15
         assert kwargs["max_payload"] == "2MB"
         assert kwargs["attachments_ok"] is False
+        assert kwargs["min_sender_trust"] == "any"
+        assert "identity" not in kwargs
         # v0.3: AgentService no longer accepts a separate ``session`` kwarg.
         assert "session" not in kwargs
 
@@ -411,10 +497,12 @@ class TestConnectFailurePaths:
         assert adapter.has_fatal_error is True
         assert adapter.fatal_error_code == "nats_connect_error"
         assert adapter.fatal_error_retryable is True
-        assert "boom" in adapter.fatal_error_message
+        assert adapter.fatal_error_message == "NATS connect failed (RuntimeError)"
         # No dangling service handle (we never even got to AgentService()).
         assert adapter._service is None
         assert adapter._nc is None
+        mock_synadia_agents.bundle.wipe.assert_called_once_with()
+        assert adapter._connection_bundle is None
 
     @pytest.mark.asyncio
     async def test_service_construction_failure_closes_nc(
@@ -433,8 +521,10 @@ class TestConnectFailurePaths:
         assert adapter.fatal_error_retryable is True
         # Partial-init nc handle was closed during teardown.
         mock_nats.connect.return_value.close.assert_awaited_once()
+        mock_synadia_agents.bundle.wipe.assert_called_once_with()
         assert adapter._nc is None
         assert adapter._service is None
+        assert adapter._connection_bundle is None
 
     @pytest.mark.asyncio
     async def test_service_start_failure_stops_service_and_closes_nc(
@@ -454,8 +544,10 @@ class TestConnectFailurePaths:
         # noisy "connection closed" warnings from the heartbeat loop.
         service.stop.assert_awaited_once()
         mock_nats.connect.return_value.close.assert_awaited_once()
+        mock_synadia_agents.bundle.wipe.assert_called_once_with()
         assert adapter._service is None
         assert adapter._nc is None
+        assert adapter._connection_bundle is None
 
 
 # ---------------------------------------------------------------------------
@@ -483,14 +575,17 @@ class TestDisconnect:
         call_order: list[str] = []
         service.stop.side_effect = lambda: call_order.append("stop")
         nc.close.side_effect = lambda: call_order.append("close")
+        mock_synadia_agents.bundle.wipe.side_effect = lambda: call_order.append("wipe")
 
         await adapter.disconnect()
 
-        assert call_order == ["stop", "close"]
+        assert call_order == ["stop", "close", "wipe"]
         service.stop.assert_awaited_once()
         nc.close.assert_awaited_once()
+        mock_synadia_agents.bundle.wipe.assert_called_once_with()
         assert adapter._service is None
         assert adapter._nc is None
+        assert adapter._connection_bundle is None
         assert adapter.is_connected is False
 
     @pytest.mark.asyncio
@@ -507,6 +602,7 @@ class TestDisconnect:
         # dropped the handles.
         assert mock_synadia_agents.AgentService.return_value.stop.await_count == 1
         assert mock_nats.connect.return_value.close.await_count == 1
+        assert mock_synadia_agents.bundle.wipe.call_count == 1
 
     @pytest.mark.asyncio
     async def test_disconnect_without_connect_is_safe_noop(
@@ -538,6 +634,35 @@ class TestDisconnect:
         mock_nats.connect.return_value.close.assert_awaited_once()
         assert adapter._service is None
         assert adapter._nc is None
+
+    @pytest.mark.asyncio
+    async def test_close_failure_retains_bundle_and_retry_does_not_overwrite_it(
+        self, mock_synadia_agents, mock_nats
+    ):
+        adapter = _build_adapter(sender_identity="signed")
+        await adapter.connect()
+        original_nc = adapter._nc
+        original_bundle = adapter._connection_bundle
+        mock_nats.connect.return_value.close.side_effect = RuntimeError("close failed")
+
+        await adapter.disconnect()
+
+        # Reconnect authentication may still use the snapshot while the old
+        # connection is alive, so teardown keeps both handles and does not wipe.
+        assert adapter._nc is original_nc
+        assert adapter._connection_bundle is original_bundle
+        mock_synadia_agents.bundle.wipe.assert_not_called()
+
+        # A retry attempts cleanup again but never replaces/leaks the retained
+        # connection or its credential snapshot when close continues to fail.
+        assert await adapter.connect() is False
+        assert adapter.fatal_error_code == "nats_cleanup_error"
+        assert adapter.fatal_error_retryable is True
+        assert adapter._nc is original_nc
+        assert adapter._connection_bundle is original_bundle
+        assert mock_nats.connect.await_count == 1
+        assert mock_synadia_agents.resolve_nats_connection_bundle.call_count == 1
+        mock_synadia_agents.bundle.wipe.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_disconnect_cancels_in_flight_handlers(
@@ -673,3 +798,24 @@ async def test_connect_short_circuits_when_sdk_unavailable(monkeypatch):
     assert adapter.has_fatal_error is True
     assert adapter.fatal_error_retryable is False
     assert adapter.is_connected is False
+
+
+@pytest.mark.parametrize(
+    ("client_api", "service_api"),
+    [
+        (SimpleNamespace(), SimpleNamespace(AgentService=object, ServiceIdentity=object)),
+        (
+            SimpleNamespace(resolve_nats_connection_bundle=lambda **_kwargs: None),
+            SimpleNamespace(AgentService=object),
+        ),
+    ],
+)
+def test_requirements_reject_incompatible_sdk_surfaces(
+    monkeypatch, client_api, service_api
+):
+    """Import success alone must not accept the pre-identity SDK pair."""
+    monkeypatch.setattr(_nats_mod, "SYNADIA_AGENTS_AVAILABLE", True)
+    monkeypatch.setattr(_nats_mod, "sdk", client_api)
+    monkeypatch.setattr(_nats_mod, "sdk_svc", service_api)
+
+    assert _nats_mod.check_nats_requirements() is False

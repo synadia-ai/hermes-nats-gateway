@@ -2,7 +2,8 @@
 
 `hermes plugins install` clones this plugin but does **not** install its Python
 dependencies (Hermes plugins are distributed as git clones, not pip packages).
-The gateway needs three runtime SDKs in the **Hermes virtualenv**, or it will log
+The gateway needs the two Synadia SDKs and their signing dependency in the
+**Hermes virtualenv**, or it will log
 `NATS: synadia-ai-agents / synadia-ai-agent-service not installed` at startup and
 skip registering the adapter.
 

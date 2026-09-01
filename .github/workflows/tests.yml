@@ -4,8 +4,56 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # Branch-stage dependency source. Keep this immutable: the registry-stage
+  # workflow replaces this wheel bridge with `uv sync --locked` after release.
+  SDK_COMMIT: a2994e6cb656d8c0d9f7609f64b0f87c2b503c3c
+  SDK_SOURCE_DATE_EPOCH: "1788216865"
+  CLIENT_SDK_SHA256: a79c11899f8628b8a82268e93e2e645c39849efa0a010f209ba0c3c0b084006f
+  AGENT_SERVICE_SDK_SHA256: 53d15ac921e75548bec99924761b38d57ca446902ee3cd29e1fee3e6c94fddee
+
 jobs:
+  build-sdk-wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pinned SDK source
+        uses: actions/checkout@v4
+        with:
+          repository: synadia-ai/synadia-agents
+          ref: ${{ env.SDK_COMMIT }}
+          path: sdk-source
+          persist-credentials: false
+      - name: Verify the SDK source revision
+        working-directory: sdk-source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SDK_COMMIT"
+          test "$(git show -s --format=%ct HEAD)" = "$SDK_SOURCE_DATE_EPOCH"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Build the pinned SDK wheels
+        env:
+          SOURCE_DATE_EPOCH: ${{ env.SDK_SOURCE_DATE_EPOCH }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sdk-wheelhouse"
+          uv build --wheel --out-dir "$RUNNER_TEMP/sdk-wheelhouse" sdk-source/client-sdk/python
+          uv build --wheel --out-dir "$RUNNER_TEMP/sdk-wheelhouse" sdk-source/agent-sdk/python
+      - name: Verify SDK wheel hashes
+        run: |
+          cd "$RUNNER_TEMP/sdk-wheelhouse"
+          printf '%s  %s\n' \
+            "$CLIENT_SDK_SHA256" synadia_ai_agents-0.8.0-py3-none-any.whl \
+            "$AGENT_SERVICE_SDK_SHA256" synadia_ai_agent_service-0.5.0-py3-none-any.whl \
+            | sha256sum --check --strict
+      - name: Upload SDK wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: pinned-python-sdk-wheels
+          path: ${{ runner.temp }}/sdk-wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
   test:
+    needs: build-sdk-wheels
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -16,9 +64,84 @@ jobs:
         uses: astral-sh/setup-uv@v3
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
-      - name: Sync deps
-        run: uv sync --all-extras
+      - name: Download pinned SDK wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: pinned-python-sdk-wheels
+          path: ${{ runner.temp }}/sdk-wheelhouse
+      - name: Verify downloaded SDK wheel hashes
+        run: |
+          cd "$RUNNER_TEMP/sdk-wheelhouse"
+          printf '%s  %s\n' \
+            "$CLIENT_SDK_SHA256" synadia_ai_agents-0.8.0-py3-none-any.whl \
+            "$AGENT_SERVICE_SDK_SHA256" synadia_ai_agent_service-0.5.0-py3-none-any.whl \
+            | sha256sum --check --strict
+      - name: Sync branch-stage deps in a clean copy
+        run: |
+          mkdir -p "$RUNNER_TEMP/hermes_under_test"
+          rsync -a --exclude .git --exclude .venv ./ "$RUNNER_TEMP/hermes_under_test/"
+          uv sync \
+            --directory "$RUNNER_TEMP/hermes_under_test" \
+            --python "${{ matrix.python-version }}" \
+            --all-extras \
+            --find-links "$RUNNER_TEMP/sdk-wheelhouse"
+      - name: Verify exact SDK artifacts
+        run: |
+          uv run --directory "$RUNNER_TEMP/hermes_under_test" python - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          import os
+          import tomllib
+
+          assert version("synadia-ai-agents") == "0.8.0"
+          assert version("synadia-ai-agent-service") == "0.5.0"
+
+          def load_packages(lock_path: Path) -> dict[str, dict]:
+              with lock_path.open("rb") as lock_file:
+                  return {
+                      package["name"]: package for package in tomllib.load(lock_file)["package"]
+                  }
+
+          packages = load_packages(Path("uv.lock"))
+          expected_wheels = {
+              "synadia-ai-agents": "synadia_ai_agents-0.8.0-py3-none-any.whl",
+              "synadia-ai-agent-service": "synadia_ai_agent_service-0.5.0-py3-none-any.whl",
+          }
+          for package_name, wheel_name in expected_wheels.items():
+              package = packages[package_name]
+              assert Path(package["source"]["registry"]).name == "sdk-wheelhouse"
+              wheels = package["wheels"]
+              assert len(wheels) == 1
+              assert Path(wheels[0]["path"]).name == wheel_name
+
+          baseline = load_packages(Path(os.environ["GITHUB_WORKSPACE"], "uv.lock"))
+          ignored = {
+              "hermes-nats-gateway",
+              "synadia-ai-agents",
+              "synadia-ai-agent-service",
+          }
+          baseline_versions = {
+              name: package["version"]
+              for name, package in baseline.items()
+              if name not in ignored
+          }
+          staged_versions = {
+              name: package["version"]
+              for name, package in packages.items()
+              if name not in ignored
+          }
+          expected_additions = {"nkeys": "0.2.1", "pynacl": "1.6.2"}
+          assert {
+              name: staged_versions.get(name) for name in expected_additions
+          } == expected_additions
+          assert set(staged_versions) - set(baseline_versions) == set(expected_additions)
+          assert {
+              name: staged_versions[name] for name in baseline_versions
+          } == baseline_versions
+          PY
       - name: Ruff
-        run: uv run ruff check .
+        run: uv run --directory "$RUNNER_TEMP/hermes_under_test" ruff check .
       - name: Pytest (offline)
-        run: uv run pytest -v
+        run: uv run --directory "$RUNNER_TEMP/hermes_under_test" pytest -v
+      - name: Verify the repository lock stayed untouched
+        run: git diff --exit-code -- uv.lock

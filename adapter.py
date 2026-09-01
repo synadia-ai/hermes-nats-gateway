@@ -1,6 +1,6 @@
 """NATS gateway adapter.
 
-Registers one ``synadia_ai.agents.AgentService`` at
+Registers one ``synadia_ai.agent_service.AgentService`` at
 ``agents.prompt.<agent>.<owner>.<session_name>`` and routes inbound
 Synadia Agent Protocol for NATS v0.3 prompts through the gateway's normal
 ``MessageEvent`` pipeline. Streams responses back chunk-by-chunk over the reply subject;
@@ -27,7 +27,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple
 
 try:
     import nats
@@ -65,6 +65,8 @@ DEFAULT_AGENT = "hermes"
 DEFAULT_HEARTBEAT_INTERVAL_S = 30
 DEFAULT_ATTACHMENTS_OK = True
 DEFAULT_ACK_KEEPALIVE_INTERVAL_S = 20
+DEFAULT_SENDER_IDENTITY: Literal["off", "signed"] = "off"
+DEFAULT_MIN_SENDER_TRUST: Literal["any", "signed"] = "any"
 
 # Conservative fallback when the broker reports max_payload=0 (rare; old
 # nats-py builds before the INFO field was surfaced). Mirrors the SDK's
@@ -108,13 +110,20 @@ _current_stream: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
 
 
 def check_nats_requirements() -> bool:
-    """Return True iff the ``synadia_ai.agents`` SDK is importable.
+    """Return True iff both compatible Synadia SDK surfaces are available.
 
     Mirrors the ``check_*_requirements`` predicate every other adapter
     exposes for ``gateway.run._create_adapter`` to short-circuit when the
     dependency is missing.
     """
-    return SYNADIA_AGENTS_AVAILABLE
+    return bool(
+        SYNADIA_AGENTS_AVAILABLE
+        and sdk is not None
+        and sdk_svc is not None
+        and callable(getattr(sdk, "resolve_nats_connection_bundle", None))
+        and callable(getattr(sdk_svc, "AgentService", None))
+        and callable(getattr(sdk_svc, "ServiceIdentity", None))
+    )
 
 
 class NatsConfigError(ValueError):
@@ -136,6 +145,12 @@ class NatsAdapterSettings:
 
     servers: Optional[List[str]]
     context: Optional[str]
+    # URL-mode connection credentials. These are passed as part of the one
+    # connection source; they are never treated as separate identity creds.
+    creds: Optional[str]
+    nkey: Optional[str]
+    sender_identity: Literal["off", "signed"]
+    min_sender_trust: Literal["any", "signed"]
     agent: str
     owner: str
     session_name: str
@@ -158,6 +173,27 @@ class NatsAdapterSettings:
         extra = extra or {}
 
         servers, context = _parse_transport(extra)
+        creds = _optional_nonempty_str(extra.get("creds"), "creds")
+        nkey = _optional_nonempty_str(extra.get("nkey"), "nkey")
+        if creds is not None and nkey is not None:
+            raise NatsConfigError("NATS: specify either 'creds' or 'nkey', not both")
+        if context is not None and (creds is not None or nkey is not None):
+            raise NatsConfigError(
+                "NATS: 'creds'/'nkey' belong to the URL connection source and "
+                "cannot accompany 'context'"
+            )
+        sender_identity = _choice(
+            extra.get("sender_identity"),
+            default=DEFAULT_SENDER_IDENTITY,
+            field_name="sender_identity",
+            allowed=("off", "signed"),
+        )
+        min_sender_trust = _choice(
+            extra.get("min_sender_trust"),
+            default=DEFAULT_MIN_SENDER_TRUST,
+            field_name="min_sender_trust",
+            allowed=("any", "signed"),
+        )
 
         agent = _require_token(
             extra.get("agent"),
@@ -214,6 +250,10 @@ class NatsAdapterSettings:
         return cls(
             servers=servers,
             context=context,
+            creds=creds,
+            nkey=nkey,
+            sender_identity=sender_identity,
+            min_sender_trust=min_sender_trust,
             agent=agent,
             owner=owner,
             session_name=session_name,
@@ -328,6 +368,38 @@ def _optional_str(value: Any, default: str, field_name: str) -> str:
     return stripped
 
 
+def _optional_nonempty_str(value: Any, field_name: str) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise NatsConfigError(
+            f"NATS: '{field_name}' must be a string, got {type(value).__name__}"
+        )
+    stripped = value.strip()
+    return stripped or None
+
+
+def _choice(
+    value: Any,
+    *,
+    default: Any,
+    field_name: str,
+    allowed: tuple[str, ...],
+):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    if not isinstance(value, str):
+        raise NatsConfigError(
+            f"NATS: '{field_name}' must be a string, got {type(value).__name__}"
+        )
+    stripped = value.strip()
+    if stripped not in allowed:
+        raise NatsConfigError(
+            f"NATS: '{field_name}' must be one of {', '.join(allowed)}, got {stripped!r}"
+        )
+    return stripped
+
+
 def _parse_optional_max_payload(value: Any) -> Optional[str]:
     """Validate a user-supplied ``max_payload``, or return ``None`` if unset.
 
@@ -431,6 +503,9 @@ class NatsAdapter(BasePlatformAdapter):
         self._active_streams: Dict[Tuple[str, int], Any] = {}
         self._nc: Optional[Any] = None
         self._service: Optional[Any] = None
+        # Retained for the lifetime of the NATS connection because reconnect
+        # authentication uses its immutable credential snapshot.
+        self._connection_bundle: Optional[Any] = None
         self._settings: Optional[NatsAdapterSettings] = None
 
         # Shutdown signalling for in-flight prompt handlers. ``_on_prompt``
@@ -482,17 +557,14 @@ class NatsAdapter(BasePlatformAdapter):
         """Open a NATS connection, register the service, and start heartbeats.
 
         Sequence (design doc §9 "Gateway startup"):
-          1. Open a NATS client via ``nats.connect(...)`` (the SDK does
-             NOT own connections — callers build the client and hand it
-             to ``AgentService``). For ``servers`` we pass the list
-             directly; for ``context`` we splat
-             ``sdk.load_context_options(name)``. :class:`NatsAdapterSettings`
-             already enforced the xor at init time.
+          1. Resolve one immutable connection bundle from either URL(s) or a
+             NATS context, then open NATS with that bundle. Optional service
+             signing comes only from the exact same credential snapshot.
           2. Best-effort liveness probe: warn (but never fail) if this
              identity already has a live responder anywhere on the server.
              Duplicate identities load-balance prompts — the protocol
              permits this for HA — so the gateway warns and starts anyway.
-          3. Build the :class:`synadia_ai.agents.AgentService` with the
+          3. Build the :class:`synadia_ai.agent_service.AgentService` with the
              resolved identity and §2.1 endpoint metadata (max_payload,
              attachments_ok) + §8.2 heartbeat cadence.
           4. Register the prompt handler (`self._on_prompt`) — mandatory
@@ -515,14 +587,37 @@ class NatsAdapter(BasePlatformAdapter):
             # Defensive — has_fatal_error should already be True in this
             # case, but guard so later code never dereferences None.
             return False
-        if not SYNADIA_AGENTS_AVAILABLE or sdk is None or sdk_svc is None:
+        if not check_nats_requirements():
             self._set_fatal_error(
                 "nats_sdk_missing",
-                "synadia-ai-agents / synadia-ai-agent-service SDKs not installed; "
-                "run: pip install 'hermes-agent[nats]'",
+                "compatible synadia-ai-agents / synadia-ai-agent-service SDKs not installed; "
+                "run this plugin's scripts/install-sdks.sh",
                 retryable=False,
             )
             return False
+
+        # A previous close failure deliberately retains both the live NATS
+        # handle and its credential snapshot. Never overwrite those handles
+        # on a retry: first try to finish the old teardown, and refuse to open
+        # a second connection while the first one still cannot be closed.
+        if (
+            self._service is not None
+            or self._nc is not None
+            or self._connection_bundle is not None
+        ):
+            await self._teardown_handles()
+            if self._nc is not None or self._connection_bundle is not None:
+                self._mark_disconnected()
+                self._set_fatal_error(
+                    "nats_cleanup_error",
+                    "Previous NATS connection could not be closed",
+                    retryable=True,
+                )
+                logger.error(
+                    "[%s] Refusing to replace an unclosed NATS connection",
+                    self.name,
+                )
+                return False
 
         settings = self._settings
 
@@ -536,19 +631,30 @@ class NatsAdapter(BasePlatformAdapter):
             # doesn't inherit a Lock potentially held by a cancelled task.
             self._session_lock = asyncio.Lock()
 
-            if settings.servers is not None:
-                # Copy the list so nats-py internals can't mutate our
-                # frozen-dataclass-owned reference.
-                self._nc = await nats.connect(servers=list(settings.servers))
-            else:
-                # Context path — let the SDK translate `nats context`
-                # JSON (creds, JWT, inbox_prefix, etc.) into nats.connect
-                # kwargs. NatsConfigError already guaranteed exactly one
-                # of servers/context is set, so this branch is correct
-                # by construction.
-                self._nc = await nats.connect(
-                    **sdk.load_context_options(settings.context)
+            if settings.context is not None:
+                self._connection_bundle = sdk.resolve_nats_connection_bundle(
+                    context=settings.context,
+                    identity=settings.sender_identity,
                 )
+            else:
+                # The shared resolver accepts comma-separated URLs and owns
+                # all URL/context/credential parsing. This adapter only
+                # translates its validated config into that public seam.
+                self._connection_bundle = sdk.resolve_nats_connection_bundle(
+                    url=",".join(settings.servers or ()),
+                    creds=settings.creds,
+                    nkey=settings.nkey,
+                    identity=settings.sender_identity,
+                )
+            if (
+                settings.sender_identity == "signed"
+                and self._connection_bundle.signer is None
+            ):
+                # This is an invariant check, not a second resolution path:
+                # signed mode must never degrade if a malformed/older helper
+                # returns a bundle without the promised connection signer.
+                raise RuntimeError("signed connection bundle has no signer")
+            self._nc = await nats.connect(**self._connection_bundle.connection_options)
 
             # Resolve max_payload — explicit user config wins, otherwise
             # derive from the broker's negotiated INFO. The SDK clamps
@@ -567,22 +673,41 @@ class NatsAdapter(BasePlatformAdapter):
             # why this can't be a hard gate.
             await self._warn_if_identity_already_live(settings)
 
-            self._service = sdk_svc.AgentService(
-                agent=settings.agent,
-                owner=settings.owner,
-                session_name=settings.session_name,
-                nc=self._nc,
-                heartbeat_interval_s=settings.heartbeat_interval_s,
-                max_payload=resolved_max_payload,
-                attachments_ok=settings.attachments_ok,
-            )
+            if settings.sender_identity == "signed":
+                # Signed resolution either supplied this signer from the
+                # connection snapshot or failed before NATS was opened.
+                self._service = sdk_svc.AgentService(
+                    agent=settings.agent,
+                    owner=settings.owner,
+                    session_name=settings.session_name,
+                    nc=self._nc,
+                    heartbeat_interval_s=settings.heartbeat_interval_s,
+                    max_payload=resolved_max_payload,
+                    attachments_ok=settings.attachments_ok,
+                    min_sender_trust=settings.min_sender_trust,
+                    identity=sdk_svc.ServiceIdentity(
+                        signer=self._connection_bundle.signer
+                    ),
+                )
+            else:
+                self._service = sdk_svc.AgentService(
+                    agent=settings.agent,
+                    owner=settings.owner,
+                    session_name=settings.session_name,
+                    nc=self._nc,
+                    heartbeat_interval_s=settings.heartbeat_interval_s,
+                    max_payload=resolved_max_payload,
+                    attachments_ok=settings.attachments_ok,
+                    min_sender_trust=settings.min_sender_trust,
+                )
             self._service.on_prompt(self._on_prompt)
             await self._service.start()
 
             self._mark_connected()
             logger.info(
                 "[%s] Connected — subscribed at agents.prompt.%s.%s.%s "
-                "(heartbeat=%ss, max_payload=%s (%s), attachments_ok=%s)",
+                "(heartbeat=%ss, max_payload=%s (%s), attachments_ok=%s, "
+                "sender_identity=%s, min_sender_trust=%s)",
                 self.name,
                 settings.agent,
                 settings.owner,
@@ -591,6 +716,8 @@ class NatsAdapter(BasePlatformAdapter):
                 resolved_max_payload,
                 max_payload_origin,
                 settings.attachments_ok,
+                settings.sender_identity,
+                settings.min_sender_trust,
             )
             return True
 
@@ -600,14 +727,13 @@ class NatsAdapter(BasePlatformAdapter):
             await self._teardown_handles()
             self._set_fatal_error(
                 "nats_connect_error",
-                f"NATS connect failed: {exc}",
+                f"NATS connect failed ({type(exc).__name__})",
                 retryable=True,
             )
             logger.error(
-                "[%s] Failed to connect to NATS: %s",
+                "[%s] Failed to connect to NATS (%s)",
                 self.name,
-                exc,
-                exc_info=True,
+                type(exc).__name__,
             )
             return False
 
@@ -631,13 +757,16 @@ class NatsAdapter(BasePlatformAdapter):
         status_subject = sdk.AgentSubject.new(
             settings.agent, settings.owner, settings.session_name
         ).status
+        assert self._nc is not None
         try:
             await self._nc.request(status_subject, b"", timeout=1.0)
         except (nats.errors.NoRespondersError, nats.errors.TimeoutError, asyncio.TimeoutError):
             return  # nobody home — identity is free
         except Exception as exc:
             logger.debug(
-                "[%s] identity liveness probe inconclusive: %s", self.name, exc
+                "[%s] identity liveness probe inconclusive (%s)",
+                self.name,
+                type(exc).__name__,
             )
             return  # probe failure must not block startup
         logger.warning(
@@ -674,6 +803,8 @@ class NatsAdapter(BasePlatformAdapter):
              still open so the heartbeat task's final iteration can
              cleanly bail out instead of racing the socket close.
           3. ``nc.close()`` — drops the underlying NATS connection.
+          4. ``bundle.wipe()`` — clears the retained auth/signing snapshot
+             only after reconnect authentication can no longer need it.
         """
         # Step 1 — drain in-flight prompt handlers. Materialize the
         # pending list first: ``cancel()`` schedules CancelledError at
@@ -703,26 +834,38 @@ class NatsAdapter(BasePlatformAdapter):
                 await self._service.stop()
             except Exception as exc:
                 logger.warning(
-                    "[%s] Error stopping AgentService: %s",
+                    "[%s] Error stopping AgentService (%s)",
                     self.name,
-                    exc,
-                    exc_info=True,
+                    type(exc).__name__,
                 )
             finally:
                 self._service = None
 
+        connection_closed = self._nc is None
         if self._nc is not None:
             try:
                 await self._nc.close()
+                connection_closed = True
             except Exception as exc:
                 logger.warning(
-                    "[%s] Error closing NATS connection: %s",
+                    "[%s] Error closing NATS connection (%s)",
                     self.name,
-                    exc,
-                    exc_info=True,
+                    type(exc).__name__,
+                )
+            else:
+                self._nc = None
+
+        if self._connection_bundle is not None and connection_closed:
+            try:
+                self._connection_bundle.wipe()
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Error wiping NATS credential snapshot (%s)",
+                    self.name,
+                    type(exc).__name__,
                 )
             finally:
-                self._nc = None
+                self._connection_bundle = None
 
     # ------------------------------------------------------------------
     # Inbound prompt handler — Phase 4
@@ -840,11 +983,15 @@ class NatsAdapter(BasePlatformAdapter):
             # terminator — CancelledError is a BaseException subclass
             # that's NOT caught by the SDK's broad `except Exception`.
             raise
-        except Exception:
-            logger.exception("[%s] NATS prompt handler failed", self.name)
+        except Exception as exc:
+            logger.error(
+                "[%s] NATS prompt handler failed (%s)",
+                self.name,
+                type(exc).__name__,
+            )
             # Re-raise so the SDK responds with a 500 error frame + terminator
             # (agent.py:270-272, §9.3).
-            raise
+            raise RuntimeError("Hermes prompt handler failed") from exc
         finally:
             if keepalive_task is not None:
                 keepalive_task.cancel()
@@ -2048,23 +2195,35 @@ def _env_enablement() -> dict | None:
     """
     nats_url = os.environ.get("NATS_URL", "").strip()
     nats_context = os.environ.get("NATS_CONTEXT", "").strip()
+    nats_creds = os.environ.get("NATS_CREDS", "").strip()
+    nats_nkey = os.environ.get("NATS_NKEY", "").strip()
+    sender_identity = os.environ.get("NATS_SENDER_IDENTITY", "").strip()
+    min_sender_trust = os.environ.get("NATS_MIN_SENDER_TRUST", "").strip()
     nats_agent = os.environ.get("HERMES_NATS_AGENT", "").strip()
     nats_owner = os.environ.get("HERMES_NATS_OWNER", "").strip()
     nats_session_name = os.environ.get("HERMES_NATS_SESSION_NAME", "").strip()
     if not (nats_url or nats_context or nats_agent or nats_owner or nats_session_name):
         return None
-    seed: dict = {}
+    config_seed: dict = {}
     if nats_url:
-        seed["servers"] = [nats_url]
+        config_seed["servers"] = [nats_url]
     if nats_context:
-        seed["context"] = nats_context
+        config_seed["context"] = nats_context
+    if nats_creds:
+        config_seed["creds"] = nats_creds
+    if nats_nkey:
+        config_seed["nkey"] = nats_nkey
+    if sender_identity:
+        config_seed["sender_identity"] = sender_identity
+    if min_sender_trust:
+        config_seed["min_sender_trust"] = min_sender_trust
     if nats_agent:
-        seed["agent"] = nats_agent
+        config_seed["agent"] = nats_agent
     if nats_owner:
-        seed["owner"] = nats_owner
+        config_seed["owner"] = nats_owner
     if nats_session_name:
-        seed["session_name"] = nats_session_name
-    return seed
+        config_seed["session_name"] = nats_session_name
+    return config_seed
 
 
 # ---------------------------------------------------------------------------
@@ -2318,16 +2477,21 @@ def interactive_setup() -> None:
         print()
 
     # ── Commit to .env ──
-    # Write the chosen transport and blank the other so re-config can swap
-    # demo↔url↔context cleanly (the adapter enforces XOR between servers
-    # and context; a stale `NATS_CONTEXT` after switching to URL would
-    # cross-wire the runtime).
+    # Write the chosen transport and blank incompatible settings so re-config
+    # can swap demo↔url↔context cleanly.  A custom URL may intentionally
+    # reuse existing URL credentials; a CLI context owns its own credentials,
+    # and the public demo is intentionally unauthenticated.
     if new_url is not None:
         save_env_value("NATS_URL", new_url)
         save_env_value("NATS_CONTEXT", "")
+        if idx == 0:
+            save_env_value("NATS_CREDS", "")
+            save_env_value("NATS_NKEY", "")
     else:
         save_env_value("NATS_URL", "")
         save_env_value("NATS_CONTEXT", new_context or "")
+        save_env_value("NATS_CREDS", "")
+        save_env_value("NATS_NKEY", "")
 
     save_env_value("HERMES_NATS_OWNER", owner)
     save_env_value("HERMES_NATS_SESSION_NAME", session)
@@ -2371,7 +2535,10 @@ def register(ctx):
         validate_config=validate_config,
         is_connected=is_connected,
         required_env=["HERMES_NATS_OWNER", "HERMES_NATS_SESSION_NAME"],
-        install_hint="pip install synadia-ai-agents synadia-ai-agent-service nkeys",
+        install_hint=(
+            "pip install synadia-ai-agents==0.8.0 "
+            "synadia-ai-agent-service==0.5.0 nkeys==0.2.1"
+        ),
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
         # Honored at runtime by gateway auth integration; Stage 2 hardens
@@ -2387,8 +2554,9 @@ def register(ctx):
         platform_hint=(
             "You are responding via the Synadia Agent Protocol for NATS. Replies stream "
             "as chunks over NATS request/reply; recipients see plain text "
-            "(no markdown rendering). The transport authenticates the caller "
-            "(NKey/JWT/TLS); treat every received message as authorized."
+            "(no markdown rendering). NATS and the configured prompt gate enforce "
+            "admission before this message reaches you. Do not infer or echo sender "
+            "identity unless the application explicitly supplies it."
         ),
     )
     try:

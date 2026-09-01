@@ -23,9 +23,10 @@ People usually reach it through an application or UI that talks to NATS under
 the hood; you can also use it to connect Hermes to other services, plug the
 agent into an event-driven pipeline, or have one agent call another over NATS.
 
-Authorization is handled by the NATS server (accounts / NKey / JWT / TLS) — the
-same model Hermes already uses for Webhooks and Home Assistant. The protocol
-spec lives at
+Connection authentication is handled by NATS (accounts / NKey / JWT / TLS).
+The gateway can additionally advertise the authenticated connection identity
+and require a verified signature on each prompt; both features are opt-in and
+independent. The protocol spec lives at
 [`synadia-ai/synadia-agent-sdk-docs`](https://github.com/synadia-ai/synadia-agent-sdk-docs/blob/main/core-protocol.md).
 
 ## Quick install
@@ -106,8 +107,13 @@ it registers is `agents.prompt.<agent>.<owner>.<session_name>`:
 | Owner | `HERMES_NATS_OWNER` | *(required)* | 4th subject token (e.g. your handle) |
 | Session | `HERMES_NATS_SESSION_NAME` | *(required)* | 5th subject token; one service = one session |
 | Transport | `NATS_URL` **or** `NATS_CONTEXT` | *(one required)* | server URL, or a named NATS CLI context |
+| URL credentials | `NATS_CREDS` **or** `NATS_NKEY` | *(none)* | Connection credential file for URL mode; not used with `NATS_CONTEXT` |
+| Service identity | `NATS_SENDER_IDENTITY` | `off` | `off` or `signed` |
+| Inbound trust | `NATS_MIN_SENDER_TRUST` | `any` | Accept `any` sender or require a verified `signed` prompt |
 
 `NATS_URL` and `NATS_CONTEXT` are mutually exclusive — set exactly one.
+`NATS_CREDS` and `NATS_NKEY` are mutually exclusive and apply only with
+`NATS_URL`.
 
 ### Recommended: the interactive wizard
 
@@ -136,6 +142,41 @@ NATS_URL=nats://127.0.0.1:14222
 HERMES_NATS_OWNER=yourname
 HERMES_NATS_SESSION_NAME=default
 ```
+
+### Connection identity and inbound trust
+
+The compatible defaults are:
+
+```bash
+NATS_SENDER_IDENTITY=off
+NATS_MIN_SENDER_TRUST=any
+```
+
+`off` means the service performs no lookup or disclosure of its own connection
+identity. `any` keeps accepting existing callers that do not attach an
+identity header.
+
+To register a signed service identity, set `NATS_SENDER_IDENTITY=signed` and
+authenticate the connection with a seed-bearing NATS context, or with one URL
+credential file:
+
+```bash
+NATS_URL=nats://127.0.0.1:4222
+NATS_CREDS=/run/secrets/hermes.creds   # alternatively NATS_NKEY=/path/user.nk
+NATS_SENDER_IDENTITY=signed
+```
+
+The gateway resolves the connection options and signer together from one
+immutable credential snapshot. The signer is never loaded from a second
+identity-only credential. If signed mode cannot derive or bind a signer to the
+live NATS user, startup fails rather than silently becoming unsigned.
+
+Inbound trust is separate. Set `NATS_MIN_SENDER_TRUST=signed` to reject a
+prompt without a valid, fresh sender signature before the normal acknowledgement
+and before Hermes receives the prompt. Status requests remain liveness checks
+and are classified without becoming an authorization gate. Sender metadata is
+available to the transport but is not inserted into the prompt text sent to the
+model.
 
 > **Dev/test NATS server — use a dedicated high port, not 4222.** A default
 > `nats-server` binds `4222`, which is very often already taken by another local
@@ -169,6 +210,10 @@ platforms:
       max_payload: "1MB"
       attachments_ok: true
       ack_keepalive_interval_s: 20
+
+      # Independent identity and prompt-admission controls.
+      sender_identity: "off"       # off | signed
+      min_sender_trust: "any"      # any | signed
 ```
 
 If you manage NATS credentials via `nats context`, set `NATS_CONTEXT` (env) or
@@ -273,19 +318,37 @@ A reply carrying `metadata.protocol_version: "0.3"` confirms the agent is live.
 
 ### Send a prompt
 
-The simplest caller is a few lines on the `synadia-ai-agents` client SDK
-(`pip install synadia-ai-agents`):
+The simplest caller is a few lines on the compatible `synadia-ai-agents`
+client SDK (`pip install synadia-ai-agents==0.8.0`):
 
 ```python
 # prompt.py
-import asyncio, sys
+import asyncio, os, sys
 import nats
-from synadia_ai.agents import Agents, DiscoverFilter, ResponseChunk
+from synadia_ai.agents import (
+    Agents,
+    DiscoverFilter,
+    Identity,
+    ResponseChunk,
+    resolve_nats_connection_bundle,
+)
 
 async def main(text: str) -> None:
-    nc = await nats.connect("nats://127.0.0.1:14222")
-    agents = Agents(nc=nc)
+    mode = os.getenv("NATS_SENDER_IDENTITY", "off")
+    bundle = resolve_nats_connection_bundle(
+        url="nats://127.0.0.1:14222",
+        creds=os.getenv("NATS_CREDS"),
+        identity=mode,
+    )
+    nc = None
+    agents = None
     try:
+        nc = await nats.connect(**bundle.connection_options)
+        agents = Agents(
+            nc=nc,
+            identity=Identity(signer=bundle.signer, name="hermes-caller")
+            if bundle.signer else None,
+        )
         found = await agents.discover(filter=DiscoverFilter(session_name="default"))
         if not found:
             sys.exit("no agent found — is the gateway running?")
@@ -293,8 +356,13 @@ async def main(text: str) -> None:
             if isinstance(msg, ResponseChunk):
                 sys.stdout.write(msg.text); sys.stdout.flush()
     finally:
-        await agents.close()
-        await nc.close()
+        try:
+            if agents is not None:
+                await agents.close()
+        finally:
+            if nc is not None:
+                await nc.close()
+            bundle.wipe()
 
 asyncio.run(main("what is 2+2? answer in one short sentence"))
 ```
@@ -358,12 +426,10 @@ the caller side, see `04-query-reply.py` in the
 - **Hermes v0.14.0 is the floor.** The plugin dispatches approvals through the
   `send_exec_approval` adapter hook, which only exists on Hermes v0.14.0+. On older
   versions the gateway loads but dangerous-command approval won't function.
-- **NATS CLI context carries only a subset of auth.** When you connect via
-  `NATS_CONTEXT`, only `url`, `token`, `user`/`password`, and the `creds` file path
-  are carried into the connection. Inline `nkey`, inline `user_jwt` / `user_seed`,
-  and the TLS triple (cert / key / CA) in a context are **silently dropped**. For
-  those auth modes, point the context (or `NATS_URL`) at a **`.creds` file**
-  instead of inline credentials.
+- **Some NATS context features remain intentionally rejected.** The shared SDK
+  resolver fails clearly on context features it cannot reproduce safely (for
+  example unsupported TLS layouts) instead of silently dropping them. Use a
+  supported context, or URL mode with `NATS_CREDS` / `NATS_NKEY`.
 
 This adapter also does not implement (by design, MVP scope): cron-based proactive
 delivery, `send_message` tool routing to NATS, chunked uploads >1 MB (inline
@@ -416,7 +482,7 @@ cd hermes-nats-gateway
 uv sync --all-extras
 
 uv run ruff check .
-uv run pytest -v          # offline unit suite (216 tests), no broker required
+uv run pytest -v          # offline unit suite, no broker required
 ```
 
 The default suite is fully offline — the NATS SDK is mocked, so no broker is

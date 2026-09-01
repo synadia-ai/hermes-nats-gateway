@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Optional connection-bound service identity via
+  `NATS_SENDER_IDENTITY=off|signed` and independent prompt admission via
+  `NATS_MIN_SENDER_TRUST=any|signed`. Defaults remain `off` and `any`, so
+  existing unsigned deployments and callers continue to work.
+- URL-mode `NATS_CREDS` and `NATS_NKEY` connection credential sources.
+
+### Changed
+- URL and context connections now use the SDK's immutable connection bundle
+  as the sole authentication and signer seam. Signed service registration can
+  only use the signer derived from the same snapshot used to authenticate the
+  live NATS connection; there is no second identity credential path.
+- Runtime SDK installation is pinned to the validated client/host pair
+  (`synadia-ai-agents==0.8.0`, `synadia-ai-agent-service==0.5.0`).
+
 ## [0.1.2] - 2026-05-20
 
 ### Changed

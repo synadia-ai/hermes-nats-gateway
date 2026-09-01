@@ -873,7 +873,9 @@ class TestOnPromptIntegration:
 
         monkeypatch.setattr(adapter, "_run_text_prompt", _boom)
 
-        with pytest.raises(RuntimeError, match="agent exploded"):
+        # Arbitrary downstream errors are not reflected onto the wire because
+        # they may contain prompt, path, or credential material.
+        with pytest.raises(RuntimeError, match="Hermes prompt handler failed"):
             await adapter._on_prompt(envelope, stream)
 
         # The SDK converts our exception into an error frame — but we

@@ -4,11 +4,11 @@ kind: platform
 version: 0.1.2
 description: >
   Synadia Agent Protocol for NATS (v0.3) gateway adapter for Hermes Agent.
-  Registers a synadia_ai.agents.AgentService at the subject
+  Registers a synadia_ai.agent_service.AgentService at the subject
   agents.prompt.<agent>.<owner>.<session_name> and routes inbound NATS
-  prompts through the gateway's MessageEvent pipeline. Authentication is
-  handled at the NATS server layer (NKey / JWT / TLS) — the transport
-  authenticates the caller, so the adapter trusts every delivered message.
+  prompts through the gateway's MessageEvent pipeline. Connection-bound
+  service identity and signed-only prompt admission are optional; existing
+  unsigned deployments remain compatible by default.
 author: Synadia Communications, Inc.
 # ``requires_env`` and ``optional_env`` entries are surfaced in the
 # ``hermes config`` UI via the platform-plugin env var injector in
@@ -38,6 +38,22 @@ optional_env:
   - name: NATS_CONTEXT
     description: "TRANSPORT (REQUIRED — set exactly one of NATS_URL or NATS_CONTEXT): name of an existing NATS CLI context for connection options. Mutually exclusive with NATS_URL; enforced by validate_config at gateway start."
     prompt: "NATS context name"
+    password: false
+  - name: NATS_CREDS
+    description: "URL-mode connection credentials: path to a NATS .creds file. This is the connection credential and, in signed mode, the only signer source. Not used with NATS_CONTEXT."
+    prompt: "NATS credentials file"
+    password: false
+  - name: NATS_NKEY
+    description: "URL-mode connection credentials: path to a user NKey seed file. Mutually exclusive with NATS_CREDS and not used with NATS_CONTEXT."
+    prompt: "NATS NKey seed file"
+    password: false
+  - name: NATS_SENDER_IDENTITY
+    description: "Service identity mode: off (default) or signed. Signed derives its signer from the selected connection credentials."
+    prompt: "Service identity mode (off/signed)"
+    password: false
+  - name: NATS_MIN_SENDER_TRUST
+    description: "Inbound prompt policy: any (default) or signed. Independent from the service's own identity mode."
+    prompt: "Minimum sender trust (any/signed)"
     password: false
   - name: HERMES_NATS_AGENT
     description: "Agent token — the 3rd segment of the NATS subject (default: hermes)"
