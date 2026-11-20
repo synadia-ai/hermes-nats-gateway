@@ -143,6 +143,15 @@ def mock_nats(monkeypatch):
 
 class TestConnectHappyPath:
     @pytest.mark.asyncio
+    async def test_connect_accepts_is_reconnect_keyword(
+        self, mock_synadia_agents, mock_nats
+    ):
+        """Hermes >= 0.23 calls ``connect(is_reconnect=...)`` on every platform."""
+        adapter = _build_adapter()
+        assert await adapter.connect(is_reconnect=True) is True
+        assert adapter.is_connected is True
+
+    @pytest.mark.asyncio
     async def test_connect_returns_true_and_marks_connected(
         self, mock_synadia_agents, mock_nats
     ):

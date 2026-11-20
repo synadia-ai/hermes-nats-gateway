@@ -478,8 +478,12 @@ class NatsAdapter(BasePlatformAdapter):
     # Lifecycle (Phase 3)
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Open a NATS connection, register the service, and start heartbeats.
+
+        ``is_reconnect`` is passed by newer Hermes gateways (>= 0.23) when the
+        reconnect watcher retries a failed platform; it needs no special handling
+        here because every call opens a fresh connection.
 
         Sequence (design doc §9 "Gateway startup"):
           1. Open a NATS client via ``nats.connect(...)`` (the SDK does

@@ -6,6 +6,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- `connect()` accepts the `is_reconnect` keyword that Hermes >= 0.23 passes to
+  every platform adapter. Without it the adapter failed to start with
+  `connect() got an unexpected keyword argument 'is_reconnect'`.
+
 ## [0.1.2] - 2026-05-20
 
 ### Changed
